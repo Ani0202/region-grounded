@@ -1,0 +1,52 @@
+# Baseline #2 from the proposal §4: SigLIP-B/16 fine-tuned with the global
+# sigmoid loss only, over the same data. Pairs with default.yaml for an
+# apples-to-apples ablation of L_region's contribution.
+run_name: baseline_global_only_v1
+output_dir: outputs
+
+stage1:
+  siglip_model: google/siglip-base-patch16-224
+  image_size: 224
+  num_regions: 5
+  min_patches_per_region: 6
+  bbox_padding: 0.05
+  use_correlation_attention: true
+  cluster_method: kmeans
+
+stage2:
+  vlm_model: Qwen/Qwen2-VL-2B-Instruct
+  caption_prompt: "Describe the main subject of this image in one short sentence."
+  max_new_tokens: 48
+  filter_model: google/siglip-base-patch16-224
+  filter_threshold: 0.18
+  batch_size: 8
+
+stage3:
+  base_model: google/siglip-base-patch16-224
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: [q_proj, k_proj, v_proj, out_proj, fc1, fc2]
+  lambda_region: 0.0            # ← only difference vs default.yaml
+  batch_size_global: 64
+  regions_per_image: 0          # ← no region branch
+  lr: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 200
+  max_steps: 5000
+  grad_accum: 1
+  mixed_precision: bf16
+  log_every: 25
+  save_every: 500
+  tensorboard: true
+  wandb_project: null
+  wandb_run_name: null
+
+data:
+  cc3m_root: data/cc3m
+  subset_size: 50000
+  regions_out: outputs/regions
+  pairs_out: outputs/pairs.parquet
+  num_workers: 4
+  seed: 1234
