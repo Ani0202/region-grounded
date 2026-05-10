@@ -33,14 +33,19 @@ from pathlib import Path
 
 def _download_via_hf(out_dir: Path, subset: int, hf_split: str = "train", shard_size: int = 1_000) -> Path:
     """Stream `pixparse/cc3m-wds`, save first `subset` decoded samples to disk."""
+    # Force these imports up front (they each take 10–20s on a cold Colab kernel)
+    # so progress lines below print on time instead of looking like a hang.
+    print("loading torch + datasets (10–20s, first-time only) …", flush=True)
+    import torch  # noqa: F401  (triggers slow lazy init now, not mid-stream)
     from datasets import load_dataset
 
     img_dir = out_dir / "img"
     img_dir.mkdir(parents=True, exist_ok=True)
     index_path = out_dir / "index.jsonl"
 
-    print(f"streaming pixparse/cc3m-wds [{hf_split}] for {subset} samples …")
+    print(f"streaming pixparse/cc3m-wds [{hf_split}] for {subset} samples …", flush=True)
     ds = load_dataset("pixparse/cc3m-wds", split=hf_split, streaming=True)
+    print("starting download (first shard ~5–10 MB) …", flush=True)
 
     n = 0
     with index_path.open("w") as out:
@@ -64,9 +69,9 @@ def _download_via_hf(out_dir: Path, subset: int, hf_split: str = "train", shard_
                 continue
             out.write(json.dumps({"image": rel, "caption": caption}) + "\n")
             n += 1
-            if n % 500 == 0:
-                print(f"  {n} / {subset}")
-    print(f"wrote {n} entries to {index_path}")
+            if n <= 5 or n % 100 == 0:
+                print(f"  {n} / {subset}", flush=True)
+    print(f"wrote {n} entries to {index_path}", flush=True)
     return index_path
 
 
