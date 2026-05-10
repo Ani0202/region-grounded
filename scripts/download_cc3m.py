@@ -32,45 +32,84 @@ from pathlib import Path
 # ---- HuggingFace backend ---------------------------------------------------
 
 def _download_via_hf(out_dir: Path, subset: int, hf_split: str = "train", shard_size: int = 1_000) -> Path:
-    """Stream `pixparse/cc3m-wds`, save first `subset` decoded samples to disk."""
-    # Force these imports up front (they each take 10–20s on a cold Colab kernel)
-    # so progress lines below print on time instead of looking like a hang.
-    print("loading torch + datasets (10–20s, first-time only) …", flush=True)
-    import torch  # noqa: F401  (triggers slow lazy init now, not mid-stream)
-    from datasets import load_dataset
+    """Download tars from `pixparse/cc3m-wds` and extract images + captions.
 
+    We read tar shards directly via `huggingface_hub` + `tarfile` instead of
+    routing through `datasets.load_dataset`, because the mirror's actual
+    schema (jpg / txt / json / __key__ / __url__) doesn't match the
+    streaming feature manifest `datasets` infers — which trips its cast
+    step on the very first batch.
+    """
+    import io
+    import tarfile
+
+    from huggingface_hub import hf_hub_download, list_repo_files
+    from PIL import Image
+
+    repo = "pixparse/cc3m-wds"
     img_dir = out_dir / "img"
     img_dir.mkdir(parents=True, exist_ok=True)
     index_path = out_dir / "index.jsonl"
 
-    print(f"streaming pixparse/cc3m-wds [{hf_split}] for {subset} samples …", flush=True)
-    ds = load_dataset("pixparse/cc3m-wds", split=hf_split, streaming=True)
-    print("starting download (first shard ~5–10 MB) …", flush=True)
+    print(f"listing tar shards in {repo} …", flush=True)
+    files = list_repo_files(repo, repo_type="dataset")
+    prefix = f"cc3m-{hf_split}-"
+    shards = sorted(f for f in files if f.startswith(prefix) and f.endswith(".tar"))
+    if not shards:
+        raise RuntimeError(f"no tars matching {prefix}*.tar in {repo}")
+    print(f"found {len(shards)} shards; fetching up to {subset} samples …", flush=True)
 
     n = 0
     with index_path.open("w") as out:
-        for ex in ds:
+        for s_idx, shard_name in enumerate(shards):
             if n >= subset:
                 break
-            # The webdataset schema gives {"jpg": PIL.Image, "txt": caption, "__key__": id}
-            image = ex.get("jpg") or ex.get("png") or ex.get("image")
-            caption = ex.get("txt") or ex.get("caption")
-            if image is None or not caption:
-                continue
-            shard = f"{n // shard_size:05d}"
-            shard_dir = img_dir / shard
-            shard_dir.mkdir(exist_ok=True)
-            stem = ex.get("__key__", f"{n:09d}").replace("/", "_")
-            rel = f"img/{shard}/{stem}.jpg"
-            try:
-                image.convert("RGB").save(out_dir / rel, quality=92)
-            except Exception as e:
-                print(f"  skip {stem}: {e}", file=sys.stderr)
-                continue
-            out.write(json.dumps({"image": rel, "caption": caption}) + "\n")
-            n += 1
-            if n <= 5 or n % 100 == 0:
-                print(f"  {n} / {subset}", flush=True)
+            print(f"  shard {s_idx + 1}/{len(shards)}: {shard_name}", flush=True)
+            local = hf_hub_download(repo, shard_name, repo_type="dataset")
+            # Group tar members by the webdataset stem (key) so jpg/txt/json line up.
+            by_stem: dict[str, dict[str, bytes]] = {}
+            with tarfile.open(local, mode="r") as tf:
+                for member in tf:
+                    if not member.isfile():
+                        continue
+                    name = member.name
+                    dot = name.find(".")
+                    if dot < 0:
+                        continue
+                    stem, ext = name[:dot], name[dot + 1:].lower()
+                    fh = tf.extractfile(member)
+                    if fh is None:
+                        continue
+                    by_stem.setdefault(stem, {})[ext] = fh.read()
+            for stem, parts in by_stem.items():
+                if n >= subset:
+                    break
+                img_bytes = parts.get("jpg") or parts.get("jpeg") or parts.get("png")
+                if not img_bytes:
+                    continue
+                caption = parts.get("txt", b"").decode("utf-8", errors="replace").strip()
+                if not caption and "json" in parts:
+                    try:
+                        meta = json.loads(parts["json"])
+                        caption = meta.get("caption") or ""
+                    except Exception:
+                        caption = ""
+                if not caption:
+                    continue
+                try:
+                    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                except Exception as e:
+                    print(f"    skip {stem}: {e}", file=sys.stderr)
+                    continue
+                bucket = f"{n // shard_size:05d}"
+                bucket_dir = img_dir / bucket
+                bucket_dir.mkdir(exist_ok=True)
+                rel = f"img/{bucket}/{stem.replace('/', '_')}.jpg"
+                img.save(out_dir / rel, quality=92)
+                out.write(json.dumps({"image": rel, "caption": caption}) + "\n")
+                n += 1
+                if n <= 5 or n % 100 == 0:
+                    print(f"    {n} / {subset}", flush=True)
     print(f"wrote {n} entries to {index_path}", flush=True)
     return index_path
 
