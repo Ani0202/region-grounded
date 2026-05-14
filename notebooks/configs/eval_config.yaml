@@ -1,0 +1,15 @@
+baseline_b0:
+  coco_maskclip: 0.16
+  coco_sclip: 0.16
+  coco_standard: 0.2
+  voc_maskclip: 3.49
+  voc_sclip: 3.48
+  voc_standard: 3.5
+eval_size: 384
+model_id: google/siglip-base-patch16-384
+patch_size: 16
+postprocess: false
+prompt_template: a photo of a {}
+tau_seg: 0.08
+upsample_mode: bilinear
+voc_ignore_label: 255

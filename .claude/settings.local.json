@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python *)",
+      "Bash(.venv/bin/pip show *)",
+      "Bash(.venv/bin/pip install *)",
+      "WebSearch",
+      "Bash(python3 *)"
+    ]
+  }
+}
