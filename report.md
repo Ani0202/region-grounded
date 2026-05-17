@@ -504,32 +504,95 @@ to force consistent in-bbox response.
 
 ---
 
-### Exp-10 — M_human v9 (top-K mean region loss) [planned]
+### Exp-10 — M_human v9 (top-K mean region loss)
 
-Hypothesis: the PG ceiling at ~20% is set by the *FILIP max-pool* region
-loss, not by capacity or LR. Max-pool's gradient incentive is:
-`max(patch_in_bbox · phrase) > max(patch_out_bbox · phrase)`. This is
-satisfied by either (a) one strong in-bbox patch (sharp argmax, good PG)
-or (b) many medium in-bbox patches (broad coverage, bad PG, ok R@1).
-The two solutions are nearly equivalent under the loss, and the optimizer
-drifts between them — explaining the mid-training collapses seen across
-v6/v7/v8.
+Same recipe as v8 (q+k+v LoRA, λ=0.5, seed=2, +best-PG snapshot, 1 epoch).
+Single change: `cfg['region_top_k']=3` → region loss replaces
+`amax(in_bbox)` with `mean(topk(in_bbox, k=3))`. Hypothesis: max-pool is
+satisfied by sharp-OR-broad equivalently; forcing K patches to score
+together biases toward consistent in-bbox clusters.
 
-**Top-K mean** replaces `max(in_bbox)` with `mean(top-K in_bbox patches)`.
-At K=3, the loss now requires *three* in-bbox patches to score high
-together — you can't satisfy it with a single spike, you need a spatial
-cluster. This is a stronger inductive bias toward the behaviour PG
-measures (a tight cluster centred near the GT bbox).
+| step | v5 | v7 | v8 | **v9** |
+|-----:|---:|---:|---:|-------:|
+|   0  | 14.74 | 14.74 | 14.74 | 14.74 |
+| 200  | 16.48 | 16.81 | 15.49 | 16.38 |
+| 400  | 19.92 | 22.69 | 19.96 | **19.35** ← best |
+| 600  | 20.62 | 17.98 | 17.70 | 16.48 |
+| 800  | 20.95 | 17.09 | 17.51 | 18.13 |
+| end  | 20.90 | 17.80 | 19.96 | **19.35** (after best-PG restore) |
 
-Recipe: identical to v8 (q+k+v LoRA, λ=0.5, seed=2, best-PG snapshot,
-1 epoch). Only the region loss function changes. K=3 default
-(`CFG['region_top_k'] = 3`); K=1 reduces to FILIP max-pool exactly.
+Final: PG 19.35%, R@1 top-10 5.50%, top-25 7.18%, halfmax 7.30%.
+Region loss converged to 0.101 (matches all prior runs).
 
-Decision rule:
-- v9 seed=2 PG > **21.25%** (v5 mean + σ_v5) → real win, re-verify on
-  seeds 0+1 to get the v9 distribution.
-- v9 seed=2 PG ∈ [18.68, 21.25] → plausibly real but within noise,
-  re-verify to confirm.
-- v9 seed=2 PG < 18.68% → top-K idea was wrong (we forced consistency
-  but lost something else); pivot to M_auto and write up M_human at
-  v5 mean.
+**Findings.**
+
+1. **Top-K=3 did not push PG up.** Peak at 19.35% on seed=2 is below v5
+   seed=2's 20.90%, within σ_v5 of the v5 mean (18.68%). The
+   sharp-vs-broad ambiguity is *not* the bottleneck.
+
+2. **Same post-peak drift shape as v6/v7/v8.** Across four independent
+   "improvements" (λ↑, +k_proj, +best-PG, +top-K loss), every modification
+   to v5's recipe produced an earlier peak followed by drift. v5's
+   monotone climb through step 800 (the only such trajectory) appears
+   to be the *underparameterized* recipe holding the model on its
+   improvement curve — every added degree of freedom let the optimizer
+   walk off it.
+
+3. **What this rules out.** We've now tested every patch-side and
+   region-loss-formulation lever:
+    - Loss weight (v6) ✗
+    - Attention-routing capacity via k_proj (v7/v8) ✗
+    - Patch aggregation (FILIP max → top-K mean) (v9) ✗
+   None move the mean. The remaining principled levers are on the
+   **text side**, which we never touched.
+
+**Next:** Exp-11 — fix the text-side train/eval mismatch (EOS alignment).
+
+---
+
+### Exp-11 — M_human v10 (EOS-aligned region loss) [planned]
+
+**Diagnosis (analogous to v1→v2 on the image side).** Training uses
+`get_phrase_token_feats` which returns every phrase token, and
+`filip_region_loss` takes a mean over them. PG / R@1 eval reads only
+`last_hidden_state[:, -1, :]` — the EOS position. Different vectors.
+This is exactly the same shape of train/eval mismatch that the
+MaskCLIP-bypass-during-training fix (v1→v2, +8.66pp) addressed on the
+image side, but on the text side and untouched since v1. Plausibly the
+final mechanistic mismatch in the pipeline.
+
+**Why this also explains the v6–v9 drift.** With mean-over-tokens, the
+training objective is satisfied by *any* parameter configuration that
+aligns in-bbox patches with the mean of the phrase's per-token features
+— but only some of those configurations also align EOS with in-bbox
+patches. Added capacity (v7) and added constraint (v9) both gave the
+optimizer more freedom to find configurations that satisfy training
+but drift away from eval. Going back to v5's underparameterized q+v
+LoRA *while also* removing the mean-over-tokens degree of freedom
+should produce a tighter trajectory.
+
+**Concrete changes from v5 (just two):**
+1. New `get_phrase_eos_feats(model, processor, phrases, device)` →
+   `(B, D)` — last non-padding token per phrase, L2-normed. Byte-for-byte
+   match with the PG eval text vector.
+2. New `eos_region_loss(patch_feats, phrase_eos_feats, bbox_masks, ...)`:
+   `sim[i, j, n] = phrase_eos_i · patch_j_n` → mask out-of-bbox per
+   image_j → `amax(dim=-1)` → sigmoid SigLIP contrastive on (B, B).
+
+**Recipe:**
+- LoRA targets: q+v (revert from q+k+v; capacity correlated with drift)
+- λ=0.5, lr=2e-4, batch=32, region_batch=64
+- 1 epoch, single cosine, restarts=1
+- seed=2 (leader)
+- +best-PG snapshot (free insurance)
+- `CFG['phrase_repr'] = 'eos'` (the actual change)
+
+**Decision rule:**
+- v10 seed=2 PG > **21.25%** (v5 mean + σ_v5) → real win on the
+  leader seed; re-verify on seeds 0+1 to estimate the v10 distribution.
+- v10 seed=2 PG ∈ [18.68, 21.25] → within v5's noise band; the EOS
+  alignment didn't break anything but also didn't deliver. Pivot to
+  M_auto using v5 + best-PG as the locked recipe.
+- v10 seed=2 PG < 18.68% → EOS gradient is too sparse compared to
+  per-token; the mean-over-tokens was providing useful signal density.
+  Pivot to M_auto with v5 (q+v, FILIP, +best-PG) locked.

@@ -148,6 +148,27 @@ def get_phrase_token_feats(model, processor, phrases, device):
     return result
 
 
+def get_phrase_eos_feats(model, processor, phrases, device):
+    """Per-phrase EOS-position feature (last non-padding token), L2-normalised.
+    Returns (B, D). This matches the PG / R@1 eval protocol exactly:
+    eval reads `last_hidden_state[:, -1, :]` of the text encoder, and
+    EOS-region-loss training reads the same vector. Fixes the v1→v9
+    text-side train/eval mismatch (training previously meaned over ALL
+    phrase tokens via get_phrase_token_feats; eval used only EOS).
+    """
+    inputs = processor(text=phrases, return_tensors='pt',
+                       padding=True, truncation=True).to(device)
+    out    = model.text_model(**inputs)
+    hs     = out.last_hidden_state                                # (B, T, D)
+    if 'attention_mask' in inputs:
+        last_idx  = (inputs['attention_mask'].sum(dim=1) - 1).clamp(min=0)
+        batch_idx = torch.arange(hs.shape[0], device=hs.device)
+        last_hs   = hs[batch_idx, last_idx]                       # (B, D)
+    else:
+        last_hs = hs[:, -1, :]
+    return F.normalize(last_hs, dim=-1)
+
+
 print('Feature extraction helpers defined (with MaskCLIP bypass).')
 '''
 
@@ -332,6 +353,50 @@ print('quick_pointing_game_eval, quick_recall1_eval defined.')
 
 TRAIN_LOOP_SRC = '''# ── 9. Training loop ─────────────────────────────────────────────────────────
 
+def eos_region_loss(patch_feats_n, phrase_eos_feats, bbox_masks,
+                    logit_scale, logit_bias, k=None):
+    """EOS-aligned region loss (v10 / Exp-11). Each phrase is represented
+    by its EOS-position embedding (B, D) — matches the PG / R@1 eval
+    protocol byte-for-byte. For each (phrase_i, image_j) pair we compute
+    sim = max-over-patches(phrase_i_eos · patch_j_n | n ∈ bbox_j), then a
+    sigmoid SigLIP contrastive over the (B, B) score matrix.
+
+    Fixes the train/eval text-side mismatch present since v1: training
+    previously meaned similarity over ALL phrase tokens (FILIP fine-grained)
+    while eval used only EOS. Direct mirror of the v1→v2 patch-side fix
+    that gave +8.66pp PG. If k is set, uses top-k mean instead of pure
+    max (analogous to topk_region_loss for the patch dimension).
+    """
+    B, N, D = patch_feats_n.shape
+    device  = patch_feats_n.device
+    dtype   = patch_feats_n.dtype
+
+    # phrase_eos_feats: (B, D); patch_feats_n: (B, N, D).
+    # sim[i, j, n] = phrase_eos_i · image_j_patch_n
+    sim = (phrase_eos_feats @ patch_feats_n.reshape(B * N, D).T).reshape(B, B, N)
+
+    # Mask out-of-bbox patches per image_j; broadcast over phrase_i dim.
+    sim = sim.masked_fill(~bbox_masks[None, :, :], float('-inf'))
+
+    if k is not None and k > 1:
+        k_eff       = min(k, N)
+        top_vals, _ = sim.topk(k_eff, dim=-1)                       # (B, B, k)
+        valid       = top_vals.isfinite()
+        top_vals    = top_vals.masked_fill(~valid, 0.0)
+        n_valid     = valid.sum(dim=-1).clamp(min=1).to(dtype)
+        scores      = top_vals.sum(dim=-1) / n_valid                # (B, B)
+    else:
+        scores = sim.amax(dim=-1)                                   # (B, B)
+
+    # Empty bboxes → 0 score (rather than -inf or nan).
+    empty_box = ~bbox_masks.any(dim=-1)                             # (B,)
+    scores    = scores.masked_fill(empty_box[None, :], 0.0)
+
+    logits = logit_scale.exp() * scores + logit_bias
+    labels = 2 * torch.eye(B, device=device) - 1
+    return -F.logsigmoid(labels * logits).mean()
+
+
 def topk_region_loss(patch_feats_n, phrase_token_feats, bbox_masks,
                      logit_scale, logit_bias, k=3):
     """Top-K mean variant of filip_region_loss. Replaces the in-bbox max-pool
@@ -473,27 +538,39 @@ def train_one_epoch(model, processor, train_ds, lambda_region,
                                          padding=True).pixel_values.to(device)
 
                 with torch.amp.autocast('cuda', enabled=(device == 'cuda')):
-                    patch_feats_n    = get_patch_feats(model, reg_pix)
-                    phrase_tok_feats = get_phrase_token_feats(
-                        model, processor, reg_phrases, device
-                    )
+                    patch_feats_n = get_patch_feats(model, reg_pix)
                     bbox_masks = torch.stack([
                         bbox_patch_mask(bbox, sz, cfg['n_side'], cfg['eval_size'])
                         for bbox, sz in zip(reg_bboxes, reg_orig_sz)
                     ]).to(device)
-                    # Dispatch: cfg['region_top_k'] in {None, 1} → FILIP max-pool;
-                    # int >= 2 → top-K mean (v9). Default preserves v5/v6/v7/v8.
-                    _top_k = cfg.get('region_top_k', None)
-                    if _top_k is not None and _top_k > 1:
-                        l_region = topk_region_loss(
-                            patch_feats_n, phrase_tok_feats, bbox_masks,
+                    # Two-axis dispatch:
+                    #   cfg['phrase_repr'] in {None, 'tokens'} → FILIP per-token mean
+                    #   cfg['phrase_repr'] == 'eos'            → EOS-aligned (v10)
+                    #   cfg['region_top_k']: None / 1 → max-pool; int >= 2 → top-K mean
+                    _phrase_repr = cfg.get('phrase_repr', 'tokens')
+                    _top_k       = cfg.get('region_top_k', None)
+                    if _phrase_repr == 'eos':
+                        phrase_eos = get_phrase_eos_feats(
+                            model, processor, reg_phrases, device
+                        )
+                        l_region = eos_region_loss(
+                            patch_feats_n, phrase_eos, bbox_masks,
                             model.logit_scale, model.logit_bias, k=_top_k,
                         )
                     else:
-                        l_region = filip_region_loss(
-                            patch_feats_n, phrase_tok_feats, bbox_masks,
-                            model.logit_scale, model.logit_bias,
+                        phrase_tok_feats = get_phrase_token_feats(
+                            model, processor, reg_phrases, device
                         )
+                        if _top_k is not None and _top_k > 1:
+                            l_region = topk_region_loss(
+                                patch_feats_n, phrase_tok_feats, bbox_masks,
+                                model.logit_scale, model.logit_bias, k=_top_k,
+                            )
+                        else:
+                            l_region = filip_region_loss(
+                                patch_feats_n, phrase_tok_feats, bbox_masks,
+                                model.logit_scale, model.logit_bias,
+                            )
 
         loss = l_global + lambda_region * l_region
 
@@ -591,40 +668,41 @@ print('Training loop defined.')
 '''
 
 TRAIN_MH_SRC = '''# ── 10. Train M_human ────────────────────────────────────────────────────────
-# Mode toggles. Same cell runs v5 variance study or v6+ leader-seed sweeps —
-# edit the constants below.
+# Mode toggles. Same cell runs v5 variance study or v6+ leader-seed sweeps.
+# Recap of priors (see report.md for full write-ups):
+#   v5 (variance,    Exp-06): n=3 seeds, q+v,   FILIP/tokens → 18.68 ± 2.57% (leader seed=2: 20.90%)
+#   v6 (λ=1.0,       Exp-07): seed=2,  q+v,   FILIP/tokens → 17.18% (λ↑ broadens, no help)
+#   v7 (q+k+v,       Exp-08): seed=2,  q+k+v, FILIP/tokens → 17.80% (noisy step-400 spike 22.69 was outlier)
+#   v8 (+ best-PG,   Exp-09): seed=2,  q+k+v, FILIP/tokens + best-PG → 19.96% (still no gain)
+#   v9 (top-K=3,     Exp-10): seed=2,  q+k+v, top3/tokens + best-PG → 19.35% (no gain)
+# Pattern across v6/v7/v8/v9: peak at step 400, post-peak drift. v5's q+v +
+# FILIP was the only recipe to climb monotonically.
 #
-#   v5 (variance,  Exp-06): SEEDS=[0,1,2], LAMBDA_OVERRIDE=None, TARGETS=None,  TOP_K=None, TAG='v5'
-#   v6 (λ sweep,   Exp-07): SEEDS=[2],     LAMBDA_OVERRIDE=1.0,  TARGETS=None,  TOP_K=None, TAG='v6'
-#   v7 (LoRA tgt,  Exp-08): SEEDS=[2],     LAMBDA_OVERRIDE=None, TARGETS=q+k+v, TOP_K=None, TAG='v7'
-#   v8 (+ best-PG, Exp-09): SEEDS=[2],     LAMBDA_OVERRIDE=None, TARGETS=q+k+v, TOP_K=None, TAG='v8'
-#   v9 (top-K loss, Exp-10): SEEDS=[2],    LAMBDA_OVERRIDE=None, TARGETS=q+k+v, TOP_K=3,    TAG='v9'
-#
-# v5: PG = 18.68 ± 2.57% (n=3) at λ=0.5. Leader seed=2 at 20.90%.
-# v6 (λ=1.0): 17.18% on seed=2 — λ↑ broadens, doesn't sharpen.
-# v7 (q+k+v):    end=17.80%, peak 22.69% at step 400 (later shown to be noisy).
-# v8 (q+k+v + best-PG snapshot): peak 19.96% at step 400 — k_proj LoRA does
-#   not move the mean. Best-PG snapshot mechanism is sound; recipe ceiling
-#   is ~20% on a good seed.
-# v9 (top-K mean region loss): replaces FILIP max-pool with top-3 mean to
-#   force consistent in-bbox response. Direct attack on the v6/v7/v8 finding
-#   that max-pool is satisfied by sharp-OR-broad patterns interchangeably.
+# v10 (Exp-11): direct mirror of the v1→v2 patch-side alignment fix (+8.66pp)
+# on the TEXT side. Training previously meaned similarity over ALL phrase
+# tokens (FILIP fine-grained); eval used ONLY the EOS token. v10 trains on
+# the same EOS vector eval reads, removing the mismatch. Reverts to q+v LoRA
+# (added capacity in v7/v8/v9 correlated with drift); keeps best-PG snapshot
+# as free insurance.
 
-SEEDS           = [2]       # leader-seed mode for fast iteration
-LAMBDA_OVERRIDE = None      # keep λ=0.5 (proven). Set float to override.
-LORA_TARGETS    = ['q_proj', 'k_proj', 'v_proj']  # q+k+v
-REGION_TOP_K    = 3         # v9: top-3 mean region loss (None / 1 → FILIP max-pool)
-EXPERIMENT_TAG  = 'v9'      # used in W&B run name + checkpoint path
-CFG['epochs']   = 1         # match v2; single cosine, restarts=1.
+SEEDS           = [2]                # leader-seed mode for fast iteration
+LAMBDA_OVERRIDE = None               # keep λ=0.5 (proven)
+LORA_TARGETS    = ['q_proj', 'v_proj']   # v10: revert to v5's most-stable target set
+REGION_TOP_K    = None               # v10: pure max-pool over patches (k=1 / FILIP-shape)
+PHRASE_REPR     = 'eos'              # v10: NEW. 'eos' aligns with eval; 'tokens' = FILIP behaviour
+EXPERIMENT_TAG  = 'v10'              # used in W&B run name + checkpoint path
+CFG['epochs']   = 1                  # match v2; single cosine, restarts=1.
 
 if REGION_TOP_K is not None:
     CFG['region_top_k'] = REGION_TOP_K
+CFG['phrase_repr'] = PHRASE_REPR
 
 if LAMBDA_OVERRIDE is not None:
     CFG['lambda_region'] = LAMBDA_OVERRIDE
 print(f'Running {EXPERIMENT_TAG} | seeds={SEEDS} | λ_region={CFG["lambda_region"]}'
       f' | LoRA targets={LORA_TARGETS if LORA_TARGETS else "default(q+v)"}'
-      f' | region_top_k={CFG.get("region_top_k", "max-pool (FILIP)")}')
+      f' | region_top_k={CFG.get("region_top_k", "max-pool (FILIP)")}'
+      f' | phrase_repr={CFG.get("phrase_repr", "tokens (FILIP)")}')
 
 # Build a per-experiment LoraConfig if LORA_TARGETS is set; otherwise reuse
 # cell-7's lora_cfg. Reads other hyperparameters from the existing config so
@@ -668,7 +746,9 @@ for seed in SEEDS:
                    'lora_targets': list(_lora_cfg_active.target_modules),
                    'lora_rank':    _lora_cfg_active.r,
                    'lora_alpha':   _lora_cfg_active.lora_alpha,
-                   'region_loss':  f'topk_k{REGION_TOP_K}' if REGION_TOP_K and REGION_TOP_K > 1 else 'filip_max'},
+                   'phrase_repr':  PHRASE_REPR or 'tokens',
+                   'region_loss':  ('eos_' if PHRASE_REPR == 'eos' else 'filip_') +
+                                   (f'top{REGION_TOP_K}' if REGION_TOP_K and REGION_TOP_K > 1 else 'max')},
         tags    = ['siglip', 'flickr30k', 'lora', 'm_human', EXPERIMENT_TAG,
                    f'seed{seed}', f'lam{CFG["lambda_region"]}'],
         reinit  = True,
