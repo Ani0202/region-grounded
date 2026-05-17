@@ -685,7 +685,7 @@ TRAIN_MH_SRC = '''# ── 10. Train M_human ───────────�
 # (added capacity in v7/v8/v9 correlated with drift); keeps best-PG snapshot
 # as free insurance.
 
-SEEDS           = [2]                # leader-seed mode for fast iteration
+SEEDS           = [0, 1]             # v10 variance check (seed=2 already done @ 21.23%)
 LAMBDA_OVERRIDE = None               # keep λ=0.5 (proven)
 LORA_TARGETS    = ['q_proj', 'v_proj']   # v10: revert to v5's most-stable target set
 REGION_TOP_K    = None               # v10: pure max-pool over patches (k=1 / FILIP-shape)
