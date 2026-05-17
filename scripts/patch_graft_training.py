@@ -53,6 +53,19 @@
     with this in place — trajectory is deterministic, peak should land at
     step 400 PG=22.69%. If v8 final PG ≈ 22.69% (vs v7's 17.80%), the win
     is real and we re-verify on seeds 0+1 for the full 3-seed mean.
+    RESULT: v8 seed=2 peak = 19.96% at step 400 (not 22.69%). v7's
+    step-400 spike was a noisy outlier — CUDA/cuDNN is not bit-deterministic
+    without extra flags, so same-seed runs trace similar but not identical
+    trajectories. Best-PG snapshot mechanism works as designed (saved us
+    from 17.51% end-of-epoch). Below v5 seed=2's 20.90%; k_proj LoRA does
+    not move the mean on its own. PG ceiling for this pipeline ≈ 20% on a
+    good seed; need a more fundamental change.
+12. (v9 / Exp-10) Replace FILIP max-pool region loss with top-K mean.
+    Both v6 (λ↑ broadens) and v7/v8 (capacity ≠ sharper) point at the same
+    bottleneck: max-pool is satisfied by ONE strong in-bbox patch OR MANY
+    medium ones. Top-K mean (k=3) forces consistent in-bbox response —
+    you cannot satisfy it with a single spike. Same recipe as v8 otherwise
+    (q+k+v, λ=0.5, seed=2, +best-PG). Cell 10 toggles REGION_TOP_K.
 
 Idempotent: re-running rewrites the same cells; the inserted cell is detected by a marker
 in its source so it isn't duplicated.
@@ -319,6 +332,64 @@ print('quick_pointing_game_eval, quick_recall1_eval defined.')
 
 TRAIN_LOOP_SRC = '''# ── 9. Training loop ─────────────────────────────────────────────────────────
 
+def topk_region_loss(patch_feats_n, phrase_token_feats, bbox_masks,
+                     logit_scale, logit_bias, k=3):
+    """Top-K mean variant of filip_region_loss. Replaces the in-bbox max-pool
+    with the mean of the top-K bbox patch similarities. k=1 is mathematically
+    equivalent to filip_region_loss. Used by v9 (Exp-10): max-pool can be
+    satisfied by ONE strong in-bbox patch (sharp argmax = good PG) OR by
+    MANY medium in-bbox patches (broad = bad PG, ok R@1); both v6 (λ↑) and
+    v7/v8 (capacity↑) showed the optimizer drifting between these. Top-K
+    mean requires K patches to land in the bbox, biasing toward tighter
+    spatial clustering. Same shape contract as filip_region_loss.
+    """
+    B, N, D = patch_feats_n.shape
+    device  = patch_feats_n.device
+    dtype   = patch_feats_n.dtype
+
+    T_max = max(t.shape[0] for t in phrase_token_feats)
+    tokens_pad  = patch_feats_n.new_zeros(B, T_max, D)
+    phrase_mask = torch.zeros(B, T_max, dtype=torch.bool, device=device)
+    for i, t in enumerate(phrase_token_feats):
+        tokens_pad[i, :t.shape[0]]  = t
+        phrase_mask[i, :t.shape[0]] = True
+
+    bbox_patches = [patch_feats_n[j][bbox_masks[j]] for j in range(B)]
+    K_max = max(max(p.shape[0] for p in bbox_patches), 1)
+    patches_pad = patch_feats_n.new_zeros(B, K_max, D)
+    patch_mask  = torch.zeros(B, K_max, dtype=torch.bool, device=device)
+    for j, p in enumerate(bbox_patches):
+        if p.shape[0] > 0:
+            patches_pad[j, :p.shape[0]] = p
+            patch_mask[j, :p.shape[0]]  = True
+
+    sim = (tokens_pad.reshape(B * T_max, D) @
+           patches_pad.reshape(B * K_max, D).T
+           ).reshape(B, T_max, B, K_max)
+    sim = sim.masked_fill(~patch_mask[None, None], float('-inf'))
+
+    # Top-K mean over patches. -inf entries (came from bbox padding) are
+    # masked out before averaging; we divide by the actual count of valid
+    # contributions, which can be < k for small bboxes.
+    k_eff       = min(k, K_max)
+    top_vals, _ = sim.topk(k_eff, dim=-1)                         # (B, T_max, B, k_eff)
+    valid_mask  = top_vals.isfinite()
+    top_vals    = top_vals.masked_fill(~valid_mask, 0.0)
+    n_valid     = valid_mask.sum(dim=-1).clamp(min=1).to(dtype)   # (B, T_max, B)
+    max_sim     = top_vals.sum(dim=-1) / n_valid                  # (B, T_max, B)
+
+    empty_box = ~patch_mask.any(dim=-1)                           # (B,)
+    max_sim   = max_sim.masked_fill(empty_box[None, None, :], 0.0)
+
+    max_sim = max_sim.masked_fill(~phrase_mask[:, :, None], 0.0)
+    n_toks  = phrase_mask.sum(dim=1).clamp(min=1).to(dtype)
+    scores  = max_sim.sum(dim=1) / n_toks[:, None]
+
+    logits = logit_scale.exp() * scores + logit_bias
+    labels = 2 * torch.eye(B, device=device) - 1
+    return -F.logsigmoid(labels * logits).mean()
+
+
 def set_seed(seed):
     """Seed Python / NumPy / torch (CPU + CUDA) so runs are reproducible up to
     cuDNN non-determinism. Pair with a torch.Generator passed to DataLoader to
@@ -410,10 +481,19 @@ def train_one_epoch(model, processor, train_ds, lambda_region,
                         bbox_patch_mask(bbox, sz, cfg['n_side'], cfg['eval_size'])
                         for bbox, sz in zip(reg_bboxes, reg_orig_sz)
                     ]).to(device)
-                    l_region = filip_region_loss(
-                        patch_feats_n, phrase_tok_feats, bbox_masks,
-                        model.logit_scale, model.logit_bias
-                    )
+                    # Dispatch: cfg['region_top_k'] in {None, 1} → FILIP max-pool;
+                    # int >= 2 → top-K mean (v9). Default preserves v5/v6/v7/v8.
+                    _top_k = cfg.get('region_top_k', None)
+                    if _top_k is not None and _top_k > 1:
+                        l_region = topk_region_loss(
+                            patch_feats_n, phrase_tok_feats, bbox_masks,
+                            model.logit_scale, model.logit_bias, k=_top_k,
+                        )
+                    else:
+                        l_region = filip_region_loss(
+                            patch_feats_n, phrase_tok_feats, bbox_masks,
+                            model.logit_scale, model.logit_bias,
+                        )
 
         loss = l_global + lambda_region * l_region
 
@@ -514,29 +594,37 @@ TRAIN_MH_SRC = '''# ── 10. Train M_human ───────────�
 # Mode toggles. Same cell runs v5 variance study or v6+ leader-seed sweeps —
 # edit the constants below.
 #
-#   v5 (variance,  Exp-06): SEEDS=[0,1,2], LAMBDA_OVERRIDE=None, TARGETS=None, TAG='v5'
-#   v6 (λ sweep,   Exp-07): SEEDS=[2],     LAMBDA_OVERRIDE=1.0,  TARGETS=None, TAG='v6'
-#   v7 (LoRA tgt,  Exp-08): SEEDS=[2],     LAMBDA_OVERRIDE=None, TARGETS=q+k+v, TAG='v7'
-#   v8 (+ best-PG, Exp-09): SEEDS=[2],     LAMBDA_OVERRIDE=None, TARGETS=q+k+v, TAG='v8'
+#   v5 (variance,  Exp-06): SEEDS=[0,1,2], LAMBDA_OVERRIDE=None, TARGETS=None,  TOP_K=None, TAG='v5'
+#   v6 (λ sweep,   Exp-07): SEEDS=[2],     LAMBDA_OVERRIDE=1.0,  TARGETS=None,  TOP_K=None, TAG='v6'
+#   v7 (LoRA tgt,  Exp-08): SEEDS=[2],     LAMBDA_OVERRIDE=None, TARGETS=q+k+v, TOP_K=None, TAG='v7'
+#   v8 (+ best-PG, Exp-09): SEEDS=[2],     LAMBDA_OVERRIDE=None, TARGETS=q+k+v, TOP_K=None, TAG='v8'
+#   v9 (top-K loss, Exp-10): SEEDS=[2],    LAMBDA_OVERRIDE=None, TARGETS=q+k+v, TOP_K=3,    TAG='v9'
 #
 # v5: PG = 18.68 ± 2.57% (n=3) at λ=0.5. Leader seed=2 at 20.90%.
-# v6 (λ=1.0): regressed to 17.18% on seed=2 — λ=0.5 is on the right side.
-# v7 (q+k+v): hit PG=22.69% at step 400 then collapsed to 17.80% by end.
-#   Capacity helps the model REACH a better point but lets it walk away.
-# v8 (q+k+v + best-PG snapshot): same recipe, but train_one_epoch now
-#   snapshots and restores the best-PG state. Trajectory is deterministic
-#   for seed=2; expected v8 final PG ≈ v7's step-400 peak = 22.69%.
+# v6 (λ=1.0): 17.18% on seed=2 — λ↑ broadens, doesn't sharpen.
+# v7 (q+k+v):    end=17.80%, peak 22.69% at step 400 (later shown to be noisy).
+# v8 (q+k+v + best-PG snapshot): peak 19.96% at step 400 — k_proj LoRA does
+#   not move the mean. Best-PG snapshot mechanism is sound; recipe ceiling
+#   is ~20% on a good seed.
+# v9 (top-K mean region loss): replaces FILIP max-pool with top-3 mean to
+#   force consistent in-bbox response. Direct attack on the v6/v7/v8 finding
+#   that max-pool is satisfied by sharp-OR-broad patterns interchangeably.
 
 SEEDS           = [2]       # leader-seed mode for fast iteration
 LAMBDA_OVERRIDE = None      # keep λ=0.5 (proven). Set float to override.
 LORA_TARGETS    = ['q_proj', 'k_proj', 'v_proj']  # q+k+v
-EXPERIMENT_TAG  = 'v8'      # adds best-PG snapshot/restore (train_one_epoch flag)
+REGION_TOP_K    = 3         # v9: top-3 mean region loss (None / 1 → FILIP max-pool)
+EXPERIMENT_TAG  = 'v9'      # used in W&B run name + checkpoint path
 CFG['epochs']   = 1         # match v2; single cosine, restarts=1.
+
+if REGION_TOP_K is not None:
+    CFG['region_top_k'] = REGION_TOP_K
 
 if LAMBDA_OVERRIDE is not None:
     CFG['lambda_region'] = LAMBDA_OVERRIDE
 print(f'Running {EXPERIMENT_TAG} | seeds={SEEDS} | λ_region={CFG["lambda_region"]}'
-      f' | LoRA targets={LORA_TARGETS if LORA_TARGETS else "default(q+v)"}')
+      f' | LoRA targets={LORA_TARGETS if LORA_TARGETS else "default(q+v)"}'
+      f' | region_top_k={CFG.get("region_top_k", "max-pool (FILIP)")}')
 
 # Build a per-experiment LoraConfig if LORA_TARGETS is set; otherwise reuse
 # cell-7's lora_cfg. Reads other hyperparameters from the existing config so
@@ -579,7 +667,8 @@ for seed in SEEDS:
                    'lr_schedule': 'cosine_single',
                    'lora_targets': list(_lora_cfg_active.target_modules),
                    'lora_rank':    _lora_cfg_active.r,
-                   'lora_alpha':   _lora_cfg_active.lora_alpha},
+                   'lora_alpha':   _lora_cfg_active.lora_alpha,
+                   'region_loss':  f'topk_k{REGION_TOP_K}' if REGION_TOP_K and REGION_TOP_K > 1 else 'filip_max'},
         tags    = ['siglip', 'flickr30k', 'lora', 'm_human', EXPERIMENT_TAG,
                    f'seed{seed}', f'lam{CFG["lambda_region"]}'],
         reinit  = True,

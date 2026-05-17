@@ -444,27 +444,92 @@ snapshot/restore added to `train_one_epoch`.
 
 ---
 
-### Exp-09 — M_human v8 (q+k+v LoRA + best-PG snapshot) [planned]
+### Exp-09 — M_human v8 (q+k+v LoRA + best-PG snapshot)
 
-Single infrastructure change: `train_one_epoch` now snapshots the trainable
-parameters (~0.4M, ~MB-scale CPU memory) whenever the periodic PG eval
-beats the best-so-far, and restores the best snapshot before returning.
-The function's `keep_best_pg` flag defaults to True, so v5 / v6 / v7
-re-runs would also benefit; for v5 this is a no-op (its trajectory was
-monotone), for v6 marginal, for v7 substantial.
+Infrastructure change: `train_one_epoch` now snapshots trainable parameters
+(~0.4M, ~MB-scale CPU memory) whenever the periodic PG eval beats the
+best-so-far, and restores the best snapshot before returning. Same recipe
+as v7 (q+k+v, λ=0.5, seed=2, 1 epoch). W&B run `m_human_v8_seed2_lam0.5`.
+Colab L4, ~42 min.
 
-Same recipe as v7 (q+k+v LoRA, λ=0.5, seed=2, 1 epoch). Trajectory is
-deterministic given the seed control wired in Exp-06, so the periodic PG
-evals should land at the same percentages: 14.74 → 16.81 → 22.69 → 17.98
-→ 17.47 → 17.80. With best-PG restore, the final eval reads the step-400
-state and should return **PG ≈ 22.69%** instead of 17.80%.
+**Decision rule from Exp-08 was wrong.** I expected v8 to reproduce v7's
+trajectory exactly (same seed + same code = same numbers). It didn't.
+CUDA/cuDNN is not bit-deterministic without
+`torch.use_deterministic_algorithms(True)`, `cudnn.deterministic=True`,
+`cudnn.benchmark=False`, and `CUBLAS_WORKSPACE_CONFIG=:4096:8` — none of
+which we set. Same-seed runs trace *similar* trajectories but with
+checkpoint-level variance of ~1–3pp.
+
+| step | v5 seed=2 (q+v) | v7 (q+k+v) | v8 (q+k+v + best-PG) |
+|-----:|----------------:|-----------:|---------------------:|
+|    0 |          14.74  |     14.74  |          14.74  |
+|  200 |          16.48  |     16.81  |          15.49  |
+|  400 |          19.92  |  **22.69** |      **19.96**   |
+|  600 |          20.62  |     17.98  |          17.70  |
+|  800 |          20.95  |     17.09  |          17.51  |
+|  end |          20.90  |     17.80  |   **19.96** (after best-PG restore) |
+
+**Findings.**
+
+1. **v8 final PG = 19.96% on seed=2** (down 0.94pp from v5 seed=2's 20.90%,
+   up 1.28pp from v5 mean 18.68%). Within σ_v5 — k_proj LoRA does not
+   move the mean.
+
+2. **v7's 22.69% at step 400 was an outlier checkpoint, not a recipe-driven
+   gain.** Same code, same seed, similar trajectory shape, but the peak
+   landed at 19.96% this time. This is the same kind of lesson as v2's
+   22.08% turning out to be a +1σ draw from v5's distribution.
+
+3. **Best-PG snapshot mechanism worked as designed.** Saved us from the
+   17.51% end-of-epoch state, landed at the 19.96% step-400 peak instead.
+   It's a free insurance policy for every future experiment — costs ~MB
+   of CPU memory, ~0 compute.
+
+4. **PG ceiling for this pipeline is ~20% on a good seed, ~18.7% on
+   average.** Three independent "this should push PG higher" experiments
+   (v6 λ↑, v7 q+k+v, v8 q+k+v + best-PG) all returned to roughly the
+   same band. The bottleneck isn't loss weight, isn't attention-routing
+   capacity, isn't end-of-training collapse — it's something deeper in
+   the training objective.
+
+5. **Common signature across v6/v7/v8.** In all three runs, the model
+   reached its PG peak well before end-of-epoch, then drifted. The
+   FILIP max-pool region loss is satisfied by either a sharp in-bbox
+   spike (good for PG) or a broad in-bbox cluster (bad for PG), and the
+   optimizer drifts between these basins. This points at the *loss
+   formulation* as the actual lever.
+
+**Next:** Exp-10 — replace FILIP max-pool with top-K mean region loss
+to force consistent in-bbox response.
+
+---
+
+### Exp-10 — M_human v9 (top-K mean region loss) [planned]
+
+Hypothesis: the PG ceiling at ~20% is set by the *FILIP max-pool* region
+loss, not by capacity or LR. Max-pool's gradient incentive is:
+`max(patch_in_bbox · phrase) > max(patch_out_bbox · phrase)`. This is
+satisfied by either (a) one strong in-bbox patch (sharp argmax, good PG)
+or (b) many medium in-bbox patches (broad coverage, bad PG, ok R@1).
+The two solutions are nearly equivalent under the loss, and the optimizer
+drifts between them — explaining the mid-training collapses seen across
+v6/v7/v8.
+
+**Top-K mean** replaces `max(in_bbox)` with `mean(top-K in_bbox patches)`.
+At K=3, the loss now requires *three* in-bbox patches to score high
+together — you can't satisfy it with a single spike, you need a spatial
+cluster. This is a stronger inductive bias toward the behaviour PG
+measures (a tight cluster centred near the GT bbox).
+
+Recipe: identical to v8 (q+k+v LoRA, λ=0.5, seed=2, best-PG snapshot,
+1 epoch). Only the region loss function changes. K=3 default
+(`CFG['region_top_k'] = 3`); K=1 reduces to FILIP max-pool exactly.
 
 Decision rule:
-- If v8 final PG ≈ 22.69% on seed=2 → real win against v5 seed=2 (20.90%)
-  by ≈ +1.8pp. Re-verify on seeds 0+1 to estimate the v8 distribution.
-- If v8 final PG differs from 22.69% by more than ~0.3pp on seed=2 →
-  something in the restore path is wrong (state didn't fully copy back,
-  device mismatch, etc.). Debug before believing the number.
-- If the new v8 distribution mean > v5 mean (18.68%) by more than σ_v5
-  (2.57pp) → push to write-up. Otherwise iterate on Tier 2 levers
-  (rank bump, longer warmup).
+- v9 seed=2 PG > **21.25%** (v5 mean + σ_v5) → real win, re-verify on
+  seeds 0+1 to get the v9 distribution.
+- v9 seed=2 PG ∈ [18.68, 21.25] → plausibly real but within noise,
+  re-verify to confirm.
+- v9 seed=2 PG < 18.68% → top-K idea was wrong (we forced consistency
+  but lost something else); pivot to M_auto and write up M_human at
+  v5 mean.
