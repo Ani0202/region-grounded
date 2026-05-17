@@ -318,3 +318,85 @@ Going forward, M_human and M_auto results should be reported as mean ± std
 over ≥3 seeds, with R@1 halfmax flagged as the most-reproducible companion
 metric (and the most-honest measure of whether the recipe is learning a
 stable grounding signal).
+
+---
+
+### Exp-07 — M_human v6 (λ_region 0.5 → 1.0, leader-seed)
+
+Hypothesis: the FILIP max-pool region loss directly targets argmax-in-bbox
+behaviour (= PG metric). Doubling its weight relative to the global loss
+should sharpen the argmax response and raise PG. Mode: leader-seed (seed=2,
+v5's strongest at 20.90%) for a clean A/B vs v5 — same data order, same
+init, only λ changes. Colab L4, ~39 min. W&B run `m_human_v6_seed2_lam1.0`.
+
+**Hypothesis was wrong.**
+
+| Metric            | v5 seed=2 (λ=0.5) | v6 seed=2 (λ=1.0) |   Δ |
+|-------------------|------------------:|------------------:|----:|
+| Pointing Game     |            20.90% |            17.18% | **−3.72** |
+| R@1 top-10        |             5.98% |             5.93% | −0.05 |
+| R@1 top-25        |             7.02% |             7.58% | **+0.56** |
+| R@1 halfmax       |             7.30% |             7.30% |  0.00 |
+| Train loss region |             0.102 |             0.099 | −0.003 |
+| Train loss global |             0.368 |             0.374 | +0.006 |
+
+**PG trajectory (seed=2, both runs):**
+
+| step | v5 (λ=0.5) | v6 (λ=1.0) |
+|-----:|-----------:|-----------:|
+|    0 |     14.74  |     14.74  |
+|  200 |     16.48  |     17.33  |
+|  400 |     19.92  | **14.45** (collapsed below B0) |
+|  600 |     20.62  |     16.62  |
+|  800 |     20.95  |     17.09  |
+|  end |     20.90  |     17.18  |
+
+**Findings.**
+
+1. **λ↑ broadens the response, doesn't sharpen it.** PG fell while R@1 top-25
+   *rose* (+0.56pp). The extra region-loss weight pushed the model toward
+   more in-bbox patches at medium similarity rather than one strong spike.
+   Max-pool loss is satisfied either way (max-of-many = max-of-spike); the
+   optimizer picked the broader path. Confirms the Exp-03 finding that
+   FILIP-max-pool does *not* uniquely target sharp argmax.
+
+2. **Global loss is structural regularisation, not just a co-objective.**
+   Halving its relative weight produced the step-400 collapse to 14.45%
+   (below B0). The global image↔caption objective is doing optimisation-
+   stability work — it constrains the patch features into a coherent manifold
+   that the region loss then sculpts. Remove that constraint and the
+   optimizer wanders into bad basins.
+
+3. **λ=0.5 is on the right side of the sharpness curve.** v2 / v5 worked
+   *because of* — not in spite of — the global loss's pull. Moving λ further
+   from 0.5 in either direction likely hurts; if we want more PG, we need a
+   different lever.
+
+4. **Region loss dropped from 0.102 to 0.099 (3% lower).** The training
+   objective was optimised marginally harder, but the val metric got worse.
+   This is the loss/metric decoupling pattern again, amplified by removing
+   the global-loss regulariser.
+
+**Next:** Exp-08 — keep λ=0.5, add capacity for attention rebalancing
+(`k_proj` to LoRA targets).
+
+---
+
+### Exp-08 — M_human v7 (LoRA targets: q+v → q+k+v) [planned]
+
+Hypothesis: the PG ceiling at λ=0.5 isn't a loss-weighting problem; it's an
+*attention-routing capacity* problem. With LoRA only on `q_proj` and
+`v_proj`, the model can modulate "what each patch projects as a query" and
+"what value features it contributes," but the *keys* — what each patch
+advertises itself as for matching — are fixed at SigLIP-pretrained values.
+PG specifically depends on which patch's key best matches the phrase token's
+Q; adding `k_proj` to LoRA gives the model direct control over that match.
+
+Cost: +50% LoRA params (q+k+v vs q+v). Same rank=4. Same λ=0.5. Same seed=2.
+Single change → clean A/B vs v5 seed=2's 20.90%. ~40 min on L4.
+
+Decision rule: if seed=2 PG > 23.5% (v5 leader + σ_v5 ≈ 2.6pp), re-verify
+on seeds 0+1 for the full distribution. If PG lands in [18.3, 23.5],
+plausibly a real but small gain — re-verify on all 3 seeds to confirm.
+If PG < 18.3, k_proj alone isn't enough and the next move is either rank
+bump (r=4 → r=8) or a different region-loss formulation.

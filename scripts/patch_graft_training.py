@@ -31,6 +31,16 @@
    leader-seed mode (seed=2, v5's strongest at 20.90%) for fast iteration;
    if a recipe change wins by > σ_v5 ≈ 2.6pp on the leader seed we re-verify
    on all 3 seeds. Cell 10 toggles: LAMBDA_OVERRIDE, SEEDS, EXPERIMENT_TAG.
+   RESULT: PG=17.18% on seed=2, Δ=-3.72pp vs v5 seed=2. λ↑ broadened patch
+   coverage instead of sharpening argmax (R@1 top-25 +0.56pp while PG fell);
+   also removed global-loss regularisation → step-400 collapse to 14.45%.
+   Conclusion: λ=0.5 is on the right side of the sharpness curve.
+10. (v7 / Exp-08) Pivot: keep λ=0.5 (proven), add `k_proj` to LoRA targets.
+    Hypothesis: PG ceiling at q+v LoRA is set by attention-routing capacity.
+    K controls what each patch "advertises" as its key — directly determines
+    which patch the phrase Q attends to most. Adding it gives the model
+    50% more LoRA params dedicated to attention rebalancing, exactly the
+    operation PG depends on. Cell 10 adds LORA_TARGETS toggle.
 
 Idempotent: re-running rewrites the same cells; the inserted cell is detected by a marker
 in its source so it isn't duplicated.
@@ -464,24 +474,43 @@ print('Training loop defined.')
 
 TRAIN_MH_SRC = '''# ── 10. Train M_human ────────────────────────────────────────────────────────
 # Mode toggles. Same cell runs v5 variance study or v6+ leader-seed sweeps —
-# edit the three constants below.
+# edit the constants below.
 #
-#   v5 (variance, Exp-06):   SEEDS=[0,1,2], LAMBDA_OVERRIDE=None, TAG='v5'
-#   v6 (λ sweep,  Exp-07):   SEEDS=[2],     LAMBDA_OVERRIDE=1.0,  TAG='v6'
+#   v5 (variance,  Exp-06): SEEDS=[0,1,2], LAMBDA_OVERRIDE=None, TARGETS=None, TAG='v5'
+#   v6 (λ sweep,   Exp-07): SEEDS=[2],     LAMBDA_OVERRIDE=1.0,  TARGETS=None, TAG='v6'
+#   v7 (LoRA tgt,  Exp-08): SEEDS=[2],     LAMBDA_OVERRIDE=None, TARGETS=['q_proj','k_proj','v_proj'], TAG='v7'
 #
 # v5 found PG = 18.68 ± 2.57% across 3 seeds at λ=0.5. Leader seed (best of 3)
-# is seed=2 at 20.90%. We iterate on seed=2 alone for speed (~40 min/run vs
-# ~120 min/full-variance) and re-verify any winning recipe across all 3
-# seeds at the end.
+# is seed=2 at 20.90%. v6 (λ=1.0) regressed to 17.18% — λ=0.5 is on the right
+# side of the sharpness curve. v7 keeps λ=0.5 and adds k_proj to LoRA targets
+# to give the model attention-routing capacity (the operation PG depends on).
 
-SEEDS           = [2]       # leader-seed mode for v6 iteration
-LAMBDA_OVERRIDE = 1.0       # v6: push region-loss weight to sharpen PG argmax
-EXPERIMENT_TAG  = 'v6'      # used in W&B run name + checkpoint path
+SEEDS           = [2]       # leader-seed mode for fast iteration
+LAMBDA_OVERRIDE = None      # v7: keep λ=0.5 (proven). Set float to override.
+LORA_TARGETS    = ['q_proj', 'k_proj', 'v_proj']  # v7: add k_proj
+EXPERIMENT_TAG  = 'v7'      # used in W&B run name + checkpoint path
 CFG['epochs']   = 1         # match v2; single cosine, restarts=1.
 
 if LAMBDA_OVERRIDE is not None:
     CFG['lambda_region'] = LAMBDA_OVERRIDE
-print(f'Running {EXPERIMENT_TAG} | seeds={SEEDS} | λ_region={CFG["lambda_region"]}')
+print(f'Running {EXPERIMENT_TAG} | seeds={SEEDS} | λ_region={CFG["lambda_region"]}'
+      f' | LoRA targets={LORA_TARGETS if LORA_TARGETS else "default(q+v)"}')
+
+# Build a per-experiment LoraConfig if LORA_TARGETS is set; otherwise reuse
+# cell-7's lora_cfg. Reads other hyperparameters from the existing config so
+# rank / alpha / dropout / bias / task_type stay consistent.
+if LORA_TARGETS is not None:
+    from peft import LoraConfig as _LoraConfig
+    _lora_cfg_active = _LoraConfig(
+        r              = lora_cfg.r,
+        lora_alpha     = lora_cfg.lora_alpha,
+        target_modules = LORA_TARGETS,
+        lora_dropout   = lora_cfg.lora_dropout,
+        bias           = lora_cfg.bias,
+        task_type      = lora_cfg.task_type,
+    )
+else:
+    _lora_cfg_active = lora_cfg
 
 # Free any leftover model from a previous run before the loop.
 import gc
@@ -505,7 +534,10 @@ for seed in SEEDS:
         project = 'region-grounded',
         name    = f'm_human_{EXPERIMENT_TAG}_seed{seed}_lam{CFG["lambda_region"]}',
         config  = {**CFG, 'variant': f'm_human_{EXPERIMENT_TAG}', 'seed': seed,
-                   'lr_schedule': 'cosine_single'},
+                   'lr_schedule': 'cosine_single',
+                   'lora_targets': list(_lora_cfg_active.target_modules),
+                   'lora_rank':    _lora_cfg_active.r,
+                   'lora_alpha':   _lora_cfg_active.lora_alpha},
         tags    = ['siglip', 'flickr30k', 'lora', 'm_human', EXPERIMENT_TAG,
                    f'seed{seed}', f'lam{CFG["lambda_region"]}'],
         reinit  = True,
@@ -519,12 +551,16 @@ for seed in SEEDS:
         torch.cuda.empty_cache()
     base_model_mh = SiglipModel.from_pretrained(CFG['model_id'],
                                                  token=os.environ['HF_TOKEN'])
-    model_mh = get_peft_model(base_model_mh, lora_cfg).to(DEVICE)
+    model_mh = get_peft_model(base_model_mh, _lora_cfg_active).to(DEVICE)
     for n, p in model_mh.named_parameters():
         if 'logit_scale' in n or 'logit_bias' in n:
             p.requires_grad_(True)
     model_mh.enable_input_require_grads()
     model_mh.gradient_checkpointing_enable()
+
+    _n_trainable = sum(p.numel() for p in model_mh.parameters() if p.requires_grad)
+    print(f'  Trainable params: {_n_trainable/1e6:.3f}M | LoRA targets: '
+          f'{list(_lora_cfg_active.target_modules)} | rank: {_lora_cfg_active.r}')
 
     steps_per_epoch = len(train_ds) // CFG['batch_size']
     n_steps_mh     = steps_per_epoch * CFG['epochs']
