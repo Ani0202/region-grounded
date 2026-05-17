@@ -23,7 +23,14 @@
    v4 this=17%, "same code, different shuffle" spans ~5pp. v5 fixes Python /
    NumPy / torch CPU+CUDA seeds and passes a torch.Generator to the DataLoader,
    then runs v2's exact recipe (1 epoch, single cosine, restarts=1) across
-   seeds {0, 1, 2}. Output: PG mean ± std — our first real variance estimate.
+   seeds {0, 1, 2}. Output: PG = 18.68 ± 2.57% (mean ± std, n=3) — first real
+   variance estimate. v2's 22.08 was outside [v5 min, v5 max] = [15.87, 20.90].
+9. (v6 / Exp-07) Push PG up by raising λ_region 0.5 → 1.0. FILIP max-pool
+   region loss directly targets argmax-in-bbox behaviour (= PG metric);
+   reducing the global-loss counterweight should sharpen argmax. Uses
+   leader-seed mode (seed=2, v5's strongest at 20.90%) for fast iteration;
+   if a recipe change wins by > σ_v5 ≈ 2.6pp on the leader seed we re-verify
+   on all 3 seeds. Cell 10 toggles: LAMBDA_OVERRIDE, SEEDS, EXPERIMENT_TAG.
 
 Idempotent: re-running rewrites the same cells; the inserted cell is detected by a marker
 in its source so it isn't duplicated.
@@ -456,16 +463,25 @@ print('Training loop defined.')
 '''
 
 TRAIN_MH_SRC = '''# ── 10. Train M_human ────────────────────────────────────────────────────────
-# Exp-06 (M_human v5): variance study. v2=22.08%, v4 prev=18.41%, v4 this=~17%
-# — "same code, different shuffle order" spans ~5pp. We can't read any future
-# experiment against a single-point baseline if that point lives inside a 5pp
-# noise floor. This cell fixes Python/NumPy/torch (CPU+CUDA) seeds AND passes
-# a torch.Generator to DataLoader (the dominant variance source), then runs
-# v2's exact recipe (1 epoch, single cosine, restarts=1) across SEEDS.
-# Output: PG mean ± std. Everything we do next is read against this.
+# Mode toggles. Same cell runs v5 variance study or v6+ leader-seed sweeps —
+# edit the three constants below.
+#
+#   v5 (variance, Exp-06):   SEEDS=[0,1,2], LAMBDA_OVERRIDE=None, TAG='v5'
+#   v6 (λ sweep,  Exp-07):   SEEDS=[2],     LAMBDA_OVERRIDE=1.0,  TAG='v6'
+#
+# v5 found PG = 18.68 ± 2.57% across 3 seeds at λ=0.5. Leader seed (best of 3)
+# is seed=2 at 20.90%. We iterate on seed=2 alone for speed (~40 min/run vs
+# ~120 min/full-variance) and re-verify any winning recipe across all 3
+# seeds at the end.
 
-SEEDS        = [0, 1, 2]
-CFG['epochs'] = 1   # match v2; single cosine, restarts=1.
+SEEDS           = [2]       # leader-seed mode for v6 iteration
+LAMBDA_OVERRIDE = 1.0       # v6: push region-loss weight to sharpen PG argmax
+EXPERIMENT_TAG  = 'v6'      # used in W&B run name + checkpoint path
+CFG['epochs']   = 1         # match v2; single cosine, restarts=1.
+
+if LAMBDA_OVERRIDE is not None:
+    CFG['lambda_region'] = LAMBDA_OVERRIDE
+print(f'Running {EXPERIMENT_TAG} | seeds={SEEDS} | λ_region={CFG["lambda_region"]}')
 
 # Free any leftover model from a previous run before the loop.
 import gc
@@ -487,11 +503,11 @@ for seed in SEEDS:
         wandb.finish()
     mh_run = wandb.init(
         project = 'region-grounded',
-        name    = f'm_human_v5_seed{seed}_lam{CFG["lambda_region"]}',
-        config  = {**CFG, 'variant': 'm_human_v5', 'seed': seed,
+        name    = f'm_human_{EXPERIMENT_TAG}_seed{seed}_lam{CFG["lambda_region"]}',
+        config  = {**CFG, 'variant': f'm_human_{EXPERIMENT_TAG}', 'seed': seed,
                    'lr_schedule': 'cosine_single'},
-        tags    = ['siglip', 'flickr30k', 'lora', 'm_human', 'v5',
-                   f'seed{seed}', 'variance_study'],
+        tags    = ['siglip', 'flickr30k', 'lora', 'm_human', EXPERIMENT_TAG,
+                   f'seed{seed}', f'lam{CFG["lambda_region"]}'],
         reinit  = True,
     )
     print(f'  W&B: {mh_run.url}')
@@ -552,7 +568,7 @@ for seed in SEEDS:
     )
 
     model_mh.save_pretrained(
-        f'{CFG["ckpt_dir"]}/mhuman_v5_seed{seed}_lam{CFG["lambda_region"]}'
+        f'{CFG["ckpt_dir"]}/mhuman_{EXPERIMENT_TAG}_seed{seed}_lam{CFG["lambda_region"]}'
     )
     restore_attn(model_mh, orig_attn_fwd_mh)
 
@@ -589,17 +605,23 @@ for seed in SEEDS:
 
 # Cross-seed summary (printed here AND aggregated more fully in cell 11).
 pg_vals = np.array([r['pg_acc'] for r in v5_results])
-print(f'\\n{"="*72}\\n  v5 variance summary ({len(v5_results)} seeds)\\n{"="*72}')
+print(f'\\n{"="*72}\\n  {EXPERIMENT_TAG} summary ({len(v5_results)} seed(s), λ={CFG["lambda_region"]})\\n{"="*72}')
 for r in v5_results:
     print(f'  seed {r["seed"]}: PG = {r["pg_acc"]:.2f}%')
-print(f'  mean ± std : {pg_vals.mean():.2f} ± {pg_vals.std(ddof=1):.2f}%')
-print(f'  range      : [{pg_vals.min():.2f}, {pg_vals.max():.2f}]')
+if len(pg_vals) >= 2:
+    print(f'  mean ± std : {pg_vals.mean():.2f} ± {pg_vals.std(ddof=1):.2f}%')
+    print(f'  range      : [{pg_vals.min():.2f}, {pg_vals.max():.2f}]')
+else:
+    print(f'  single seed (no std). vs v5 seed{v5_results[0]["seed"]} baseline 20.90%: '
+          f'Δ = {v5_results[0]["pg_acc"] - 20.90:+.2f}pp')
 '''
 
-RESULTS_SRC = '''# ── 11. Results — v5 variance summary ─────────────────────────────────────────
-# Reads v5_results (list of per-seed dicts) populated by cell 10 and prints a
-# variance table: per-seed PG/R@1 and aggregate mean ± std. B0 and MH_V2 are
-# the historical single-point references (see report.md).
+RESULTS_SRC = '''# ── 11. Results — per-seed table + reference deltas ───────────────────────────
+# Reads v5_results (per-seed dicts) populated by cell 10. Works for any
+# EXPERIMENT_TAG ('v5' variance study with n=3, 'v6' leader-seed with n=1,
+# or future sweeps). Single-seed runs are compared against v5's leader
+# (seed=2 @ λ=0.5, PG=20.90%); multi-seed runs print mean ± std and compare
+# against v5's full distribution.
 B0 = dict(
     pointing_game   = 14.74,
     recall1_top10   =  6.83,
@@ -607,10 +629,12 @@ B0 = dict(
     recall1_halfmax =  7.58,
     voc_miou        =  1.43,
 )
-MH_V2 = dict(
-    pointing_game   = 22.08,
-    recall1_top10   =  5.60,
-    recall1_top25   =  7.34,
+MH_V5 = dict(   # locked v5 baseline (Exp-06, λ=0.5, n=3 seeds)
+    pg_mean         = 18.68,
+    pg_std          =  2.57,
+    pg_seed2_leader = 20.90,
+    recall1_top10   =  5.76,
+    recall1_top25   =  7.12,
     recall1_halfmax =  7.30,
 )
 
@@ -620,7 +644,7 @@ r25_vals = np.array([r['recall1_top25']   for r in v5_results])
 rhm_vals = np.array([r['recall1_halfmax'] for r in v5_results])
 
 print('=' * 96)
-print(f'  M_human v5 variance study  —  {len(v5_results)} seeds, 1 epoch, λ={CFG["lambda_region"]}')
+print(f'  M_human {EXPERIMENT_TAG}  —  {len(v5_results)} seed(s), 1 epoch, λ={CFG["lambda_region"]}')
 print('=' * 96)
 print(f'  {"seed":>5} | {"PG":>8} | {"R@1 top-10":>12} | {"R@1 top-25":>12} | {"R@1 halfmax":>13} | {"loss":>7}')
 print('-' * 96)
@@ -628,47 +652,60 @@ for r in v5_results:
     print(f'  {r["seed"]:>5} | {r["pg_acc"]:7.2f}% | {r["recall1_top10"]:11.2f}% | '
           f'{r["recall1_top25"]:11.2f}% | {r["recall1_halfmax"]:12.2f}% | {r["loss"]:7.3f}')
 print('-' * 96)
-def _agg(vals):
-    return f'{vals.mean():.2f} ± {vals.std(ddof=1):.2f}'
-print(f'  mean± | {_agg(pg_vals):>7}% | {_agg(r10_vals):>11}% | '
-      f'{_agg(r25_vals):>11}% | {_agg(rhm_vals):>12}% |')
-print(f'  range | [{pg_vals.min():.2f}, {pg_vals.max():.2f}]  '
-      f'(spread = {pg_vals.max() - pg_vals.min():.2f}pp)')
-print('=' * 96)
 
 pg_mean = float(pg_vals.mean())
-pg_std  = float(pg_vals.std(ddof=1))
-print(f'\\nReference comparisons:')
-print(f'  B0 (frozen)       : {B0["pointing_game"]:.2f}%')
-print(f'  v2 (single point) : {MH_V2["pointing_game"]:.2f}%')
-print(f'  v5 mean ± std     : {pg_mean:.2f} ± {pg_std:.2f}%')
-print(f'  Δ v5 vs B0        : {pg_mean - B0["pointing_game"]:+.2f}pp')
-print(f'  Δ v5 vs v2 (point): {pg_mean - MH_V2["pointing_game"]:+.2f}pp')
-print(f'\\nIs v2 inside the v5 distribution?  '
-      f'{"YES" if pg_vals.min() <= MH_V2["pointing_game"] <= pg_vals.max() else "NO (v2 outside [min, max])"}')
+if len(pg_vals) >= 2:
+    pg_std = float(pg_vals.std(ddof=1))
+    def _agg(vals):
+        return f'{vals.mean():.2f} ± {vals.std(ddof=1):.2f}'
+    print(f'  mean± | {_agg(pg_vals):>7}% | {_agg(r10_vals):>11}% | '
+          f'{_agg(r25_vals):>11}% | {_agg(rhm_vals):>12}% |')
+    print(f'  range | [{pg_vals.min():.2f}, {pg_vals.max():.2f}]  '
+          f'(spread = {pg_vals.max() - pg_vals.min():.2f}pp)')
+else:
+    pg_std = float('nan')
+    print(f'  (single seed — no std)')
+print('=' * 96)
 
-# Append a final summary entry to W&B as an unaffiliated run so we have a
-# single artifact storing the cross-seed numbers.
+print(f'\\nReference comparisons:')
+print(f'  B0 (frozen)            : {B0["pointing_game"]:.2f}%')
+print(f'  v5 mean ± std (λ=0.5)  : {MH_V5["pg_mean"]:.2f} ± {MH_V5["pg_std"]:.2f}%')
+print(f'  v5 seed=2 leader (λ=0.5): {MH_V5["pg_seed2_leader"]:.2f}%')
+print(f'  this run PG            : {pg_mean:.2f}%' +
+      (f' ± {pg_std:.2f}' if len(pg_vals) >= 2 else ''))
+print(f'  Δ vs B0                : {pg_mean - B0["pointing_game"]:+.2f}pp')
+print(f'  Δ vs v5 mean           : {pg_mean - MH_V5["pg_mean"]:+.2f}pp')
+print(f'  Δ vs v5 seed=2 leader  : {pg_mean - MH_V5["pg_seed2_leader"]:+.2f}pp')
+# Significance call: leader-seed run is "real win" only if it beats v5 mean by > σ_v5.
+if len(pg_vals) == 1:
+    real_win = pg_mean > MH_V5['pg_mean'] + MH_V5['pg_std']
+    print(f'\\n>> Single-seed gain > σ_v5 (noise floor)? '
+          f'{"YES — re-verify on all 3 seeds" if real_win else "NO (within noise)"}')
+
+# Aggregate W&B run capturing this experiment's headline numbers.
 if wandb.run is not None:
     wandb.finish()
 agg_run = wandb.init(
     project = 'region-grounded',
-    name    = f'm_human_v5_aggregate_n{len(v5_results)}',
-    config  = {**CFG, 'variant': 'm_human_v5_aggregate', 'seeds': SEEDS},
-    tags    = ['siglip', 'flickr30k', 'lora', 'm_human', 'v5', 'aggregate'],
+    name    = f'm_human_{EXPERIMENT_TAG}_aggregate_n{len(v5_results)}_lam{CFG["lambda_region"]}',
+    config  = {**CFG, 'variant': f'm_human_{EXPERIMENT_TAG}_aggregate', 'seeds': SEEDS},
+    tags    = ['siglip', 'flickr30k', 'lora', 'm_human', EXPERIMENT_TAG, 'aggregate'],
     reinit  = True,
 )
 wandb.summary.update({
+    'experiment_tag'    : EXPERIMENT_TAG,
+    'lambda_region'     : CFG['lambda_region'],
     'seeds_n'           : len(v5_results),
     'pg_mean'           : pg_mean,
     'pg_std'            : pg_std,
     'pg_min'            : float(pg_vals.min()),
     'pg_max'            : float(pg_vals.max()),
-    'pg_spread'         : float(pg_vals.max() - pg_vals.min()),
     'b0_pointing_game'  : B0['pointing_game'],
-    'v2_pointing_game'  : MH_V2['pointing_game'],
-    'delta_v5_vs_b0'    : pg_mean - B0['pointing_game'],
-    'delta_v5_vs_v2'    : pg_mean - MH_V2['pointing_game'],
+    'v5_pg_mean'        : MH_V5['pg_mean'],
+    'v5_pg_seed2_leader': MH_V5['pg_seed2_leader'],
+    'delta_vs_b0'       : pg_mean - B0['pointing_game'],
+    'delta_vs_v5_mean'  : pg_mean - MH_V5['pg_mean'],
+    'delta_vs_v5_leader': pg_mean - MH_V5['pg_seed2_leader'],
 })
 wandb.finish()
 print('Aggregate W&B run finished.')

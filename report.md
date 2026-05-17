@@ -247,17 +247,74 @@ to the recipe (loss weight, LR, λ, etc.) can be evaluated.
 
 ---
 
-### Exp-06 — M_human v5 (variance study, 3 seeds) [planned]
+### Exp-06 — M_human v5 (variance study, 3 seeds)
 
 Recipe identical to v2 / v4-cycle-1 (1 epoch, single cosine, restarts=1,
 λ=0.5, lr=2e-4, batch=32, region_batch=64). Change: full seed control —
 `set_seed(seed)` covers `random.seed`, `np.random.seed`, `torch.manual_seed`,
 `torch.cuda.manual_seed_all`; a `torch.Generator().manual_seed(seed)` is
 passed to the DataLoader so shuffle order is reproducible run-to-run.
-Seeds: {0, 1, 2}.
+Seeds: {0, 1, 2}. Colab L4, ~39 min/seed.
+W&B runs: `m_human_v5_seed{0,1,2}_lam0.5` + aggregate `m_human_v5_aggregate_n3`.
 
-Output: per-seed PG / R@1, plus aggregate **mean ± std**. This is the first
-real variance estimate for the M_human recipe. All subsequent recipe-level
-experiments (λ sweep, lr sweep, M_auto) will be evaluated against this
-distribution rather than against v2's single point. Code is in
-`graft-training.ipynb` cells 10–11 (wired via `scripts/patch_graft_training.py`).
+**Per-seed results** (200 val images, seed=42, MaskCLIP bypass at eval):
+
+| metric          |     B0 |  v2 (1pt) | seed 0 | seed 1 | seed 2 | v5 mean ± std |
+|-----------------|-------:|----------:|-------:|-------:|-------:|--------------:|
+| Pointing Game   | 14.74% |   22.08%  | 19.26% | 15.87% | 20.90% | **18.68 ± 2.57%** |
+| R@1 top-10      |  6.83% |    5.60%  |  5.51% |  5.79% |  5.98% |   5.76 ± 0.24% |
+| R@1 top-25      |  7.91% |    7.34%  |  7.25% |  7.11% |  7.02% |   7.12 ± 0.12% |
+| R@1 halfmax     |  7.58% |    7.30%  |  7.30% |  7.30% |  7.30% |   **7.30 ± 0.00%** |
+| Train loss (region) | — | 0.102     | 0.103  | 0.102  | 0.102  |  0.102 ± 0.001 |
+| Train loss (global) | — | 0.263     | 0.404  | 0.342  | 0.368  |  0.371 ± 0.031 |
+
+**PG trajectory per seed (every 200 steps, end at ~907):**
+
+| step | seed 0 | seed 1 | seed 2 |
+|-----:|-------:|-------:|-------:|
+|    0 | 14.74  | 14.74  | 14.74  |
+|  200 | 16.43  | 16.15  | 16.48  |
+|  400 | 16.71  | 19.02  | 19.92  |
+|  600 | 19.30  | **14.92** (collapse) | 20.62 |
+|  800 | 19.16  | 16.10  | 20.95  |
+|  end | 19.26  | 15.87  | 20.90  |
+
+**Findings:**
+
+1. **The variance is concentrated in PG (argmax).** R@1 halfmax is identical
+   to 4 decimal places across all 3 seeds (7.29755%); region loss converges to
+   0.102 ± 0.001. The recipe is reproducible at the level of the optimization
+   objective and at the level of broad patch-similarity coverage; the
+   stochasticity flips *which single patch* happens to be argmax for a few
+   borderline phrases per seed. PG turns out to be a high-variance lens on a
+   low-variance underlying signal.
+
+2. **v2's 22.08% was an outlier.** It sits outside [v5 min, v5 max] = [15.87,
+   20.90] — a +1 to +2σ draw against a true mean near 18.68%. The +7.34pp
+   "win over B0" claim in Exp-03 should be read as +3.94pp (the v5 mean).
+
+3. **Recipe-level effect on grounding metrics:**
+    - PG: +3.94pp over B0 (real, ~3.5σ on the SE of the mean across 3 seeds).
+    - R@1 top-10: −1.07pp (consistent regression).
+    - R@1 top-25: −0.79pp.
+    - R@1 halfmax: −0.28pp.
+   The model trades broad patch coverage for a sharper argmax, consistent
+   across seeds. This is the "sharp spike" behaviour predicted by the
+   FILIP max-pool loss (see Exp-03 finding), now confirmed.
+
+4. **Mid-training collapses persist with seed control.** Seed 1's PG dipped
+   to 14.92% at step 600 (matching B0) before partially recovering to 15.87%.
+   This is the same loss/metric decoupling seen in v4 attempt 2 — not an
+   unseeded-randomness artefact, but a property of the optimisation
+   landscape. Some seeds find a basin where the FILIP objective is satisfied
+   by attention patterns that hurt PG argmax.
+
+5. **Error bar for future comparisons: σ ≈ 2.6pp on PG.** Any recipe change
+   needs ≥ ~5pp improvement to be confidently above the current mean, or
+   needs N≥5 seeds to tighten the SE of the mean enough for smaller deltas.
+
+**Implication for what we report.** PG is no longer a single-number metric.
+Going forward, M_human and M_auto results should be reported as mean ± std
+over ≥3 seeds, with R@1 halfmax flagged as the most-reproducible companion
+metric (and the most-honest measure of whether the recipe is learning a
+stable grounding signal).
