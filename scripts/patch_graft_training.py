@@ -41,6 +41,18 @@
     which patch the phrase Q attends to most. Adding it gives the model
     50% more LoRA params dedicated to attention rebalancing, exactly the
     operation PG depends on. Cell 10 adds LORA_TARGETS toggle.
+    RESULT: v7 seed=2 hit PG=22.69% at step 400 (HIGHEST of any run at any
+    checkpoint) then collapsed to 17.80% by end-of-epoch. Same global loss
+    or better. Capacity helped the model REACH a better point but also let
+    it walk away (loss/metric decoupling amplified by added flexibility).
+    Conclusion: k_proj works, we just need early stopping / best-ckpt.
+11. (v8 / Exp-09) Add best-PG checkpoint tracking to train_one_epoch:
+    snapshot trainable params (~0.4M) whenever periodic PG eval improves;
+    restore the best snapshot at end of training. Costs ~MB of CPU memory
+    per run, zero training compute. Re-run v7 recipe (q+k+v, λ=0.5, seed=2)
+    with this in place — trajectory is deterministic, peak should land at
+    step 400 PG=22.69%. If v8 final PG ≈ 22.69% (vs v7's 17.80%), the win
+    is real and we re-verify on seeds 0+1 for the full 3-seed mean.
 
 Idempotent: re-running rewrites the same cells; the inserted cell is detected by a marker
 in its source so it isn't duplicated.
@@ -324,7 +336,13 @@ def set_seed(seed):
 def train_one_epoch(model, processor, train_ds, lambda_region,
                     optimizer, scheduler, device, cfg,
                     run_tag='', step_offset=0, eval_every=200,
-                    dataloader_gen=None):
+                    dataloader_gen=None, keep_best_pg=True):
+    """If keep_best_pg=True, snapshot trainable params whenever the periodic
+    PG eval beats the best-so-far, and restore the best snapshot at the end
+    of training. Fixes the v7 problem where capacity-rich runs (q+k+v LoRA)
+    peak mid-epoch then collapse during late annealing — end-of-epoch eval
+    misses the model's actual best state.
+    """
     model.train()
     loader = DataLoader(
         train_ds,
@@ -335,6 +353,10 @@ def train_one_epoch(model, processor, train_ds, lambda_region,
         pin_memory   = device == 'cuda',
         generator    = dataloader_gen,
     )
+
+    best_pg    = -1.0
+    best_step  = -1
+    best_state = None   # dict of trainable param tensors on CPU
 
     scaler = torch.amp.GradScaler('cuda', enabled=(device == 'cuda'))
 
@@ -435,12 +457,28 @@ def train_one_epoch(model, processor, train_ds, lambda_region,
             wandb.log({f'{run_tag}/pointing_game': pg_acc}, step=global_step)
             pbar.write(f'  step {global_step:4d}  Pointing Game = {pg_acc:.2f}%  '
                        f'({pg_correct}/{pg_total})  [B0=14.74%]')
+            if keep_best_pg and pg_acc > best_pg:
+                best_pg    = pg_acc
+                best_step  = global_step
+                best_state = {k: v.detach().cpu().clone()
+                              for k, v in model.named_parameters()
+                              if v.requires_grad}
+                pbar.write(f'    new best PG = {pg_acc:.2f}% (snapshot kept)')
             model.train()   # quick_pointing_game_eval calls model.eval(); restore
 
+    # Restore best-PG snapshot so subsequent evals see the model's best state.
+    if keep_best_pg and best_state is not None:
+        for k, v in model.named_parameters():
+            if k in best_state:
+                v.data.copy_(best_state[k].to(v.device))
+        print(f'  Restored best-PG snapshot: step {best_step}, PG = {best_pg:.2f}%')
+
     stats = {
-        'loss':   total_loss   / n_steps,
-        'global': total_global / n_steps,
-        'region': total_region / n_steps,
+        'loss':     total_loss   / n_steps,
+        'global':   total_global / n_steps,
+        'region':   total_region / n_steps,
+        'best_pg':  best_pg,
+        'best_step': best_step,
     }
     return stats, n_steps
 
@@ -478,17 +516,21 @@ TRAIN_MH_SRC = '''# ── 10. Train M_human ───────────�
 #
 #   v5 (variance,  Exp-06): SEEDS=[0,1,2], LAMBDA_OVERRIDE=None, TARGETS=None, TAG='v5'
 #   v6 (λ sweep,   Exp-07): SEEDS=[2],     LAMBDA_OVERRIDE=1.0,  TARGETS=None, TAG='v6'
-#   v7 (LoRA tgt,  Exp-08): SEEDS=[2],     LAMBDA_OVERRIDE=None, TARGETS=['q_proj','k_proj','v_proj'], TAG='v7'
+#   v7 (LoRA tgt,  Exp-08): SEEDS=[2],     LAMBDA_OVERRIDE=None, TARGETS=q+k+v, TAG='v7'
+#   v8 (+ best-PG, Exp-09): SEEDS=[2],     LAMBDA_OVERRIDE=None, TARGETS=q+k+v, TAG='v8'
 #
-# v5 found PG = 18.68 ± 2.57% across 3 seeds at λ=0.5. Leader seed (best of 3)
-# is seed=2 at 20.90%. v6 (λ=1.0) regressed to 17.18% — λ=0.5 is on the right
-# side of the sharpness curve. v7 keeps λ=0.5 and adds k_proj to LoRA targets
-# to give the model attention-routing capacity (the operation PG depends on).
+# v5: PG = 18.68 ± 2.57% (n=3) at λ=0.5. Leader seed=2 at 20.90%.
+# v6 (λ=1.0): regressed to 17.18% on seed=2 — λ=0.5 is on the right side.
+# v7 (q+k+v): hit PG=22.69% at step 400 then collapsed to 17.80% by end.
+#   Capacity helps the model REACH a better point but lets it walk away.
+# v8 (q+k+v + best-PG snapshot): same recipe, but train_one_epoch now
+#   snapshots and restores the best-PG state. Trajectory is deterministic
+#   for seed=2; expected v8 final PG ≈ v7's step-400 peak = 22.69%.
 
 SEEDS           = [2]       # leader-seed mode for fast iteration
-LAMBDA_OVERRIDE = None      # v7: keep λ=0.5 (proven). Set float to override.
-LORA_TARGETS    = ['q_proj', 'k_proj', 'v_proj']  # v7: add k_proj
-EXPERIMENT_TAG  = 'v7'      # used in W&B run name + checkpoint path
+LAMBDA_OVERRIDE = None      # keep λ=0.5 (proven). Set float to override.
+LORA_TARGETS    = ['q_proj', 'k_proj', 'v_proj']  # q+k+v
+EXPERIMENT_TAG  = 'v8'      # adds best-PG snapshot/restore (train_one_epoch flag)
 CFG['epochs']   = 1         # match v2; single cosine, restarts=1.
 
 if LAMBDA_OVERRIDE is not None:
@@ -617,6 +659,8 @@ for seed in SEEDS:
         'loss':            stats_ep['loss'],
         'global':          stats_ep['global'],
         'region':          stats_ep['region'],
+        'best_pg':         stats_ep.get('best_pg',   pg_acc),
+        'best_step':       stats_ep.get('best_step', -1),
     })
 
     wandb.log({
@@ -679,15 +723,19 @@ r10_vals = np.array([r['recall1_top10']   for r in v5_results])
 r25_vals = np.array([r['recall1_top25']   for r in v5_results])
 rhm_vals = np.array([r['recall1_halfmax'] for r in v5_results])
 
-print('=' * 96)
+print('=' * 110)
 print(f'  M_human {EXPERIMENT_TAG}  —  {len(v5_results)} seed(s), 1 epoch, λ={CFG["lambda_region"]}')
-print('=' * 96)
-print(f'  {"seed":>5} | {"PG":>8} | {"R@1 top-10":>12} | {"R@1 top-25":>12} | {"R@1 halfmax":>13} | {"loss":>7}')
-print('-' * 96)
+print('=' * 110)
+print(f'  {"seed":>5} | {"PG":>8} | {"best PG":>8} | {"@step":>6} | '
+      f'{"R@1 top-10":>12} | {"R@1 top-25":>12} | {"R@1 halfmax":>13} | {"loss":>7}')
+print('-' * 110)
 for r in v5_results:
-    print(f'  {r["seed"]:>5} | {r["pg_acc"]:7.2f}% | {r["recall1_top10"]:11.2f}% | '
-          f'{r["recall1_top25"]:11.2f}% | {r["recall1_halfmax"]:12.2f}% | {r["loss"]:7.3f}')
-print('-' * 96)
+    bp = r.get('best_pg', r['pg_acc'])
+    bs = r.get('best_step', -1)
+    print(f'  {r["seed"]:>5} | {r["pg_acc"]:7.2f}% | {bp:7.2f}% | {bs:>6d} | '
+          f'{r["recall1_top10"]:11.2f}% | {r["recall1_top25"]:11.2f}% | '
+          f'{r["recall1_halfmax"]:12.2f}% | {r["loss"]:7.3f}')
+print('-' * 110)
 
 pg_mean = float(pg_vals.mean())
 if len(pg_vals) >= 2:

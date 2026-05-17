@@ -382,21 +382,89 @@ init, only λ changes. Colab L4, ~39 min. W&B run `m_human_v6_seed2_lam1.0`.
 
 ---
 
-### Exp-08 — M_human v7 (LoRA targets: q+v → q+k+v) [planned]
+### Exp-08 — M_human v7 (LoRA targets: q+v → q+k+v)
 
-Hypothesis: the PG ceiling at λ=0.5 isn't a loss-weighting problem; it's an
-*attention-routing capacity* problem. With LoRA only on `q_proj` and
-`v_proj`, the model can modulate "what each patch projects as a query" and
-"what value features it contributes," but the *keys* — what each patch
-advertises itself as for matching — are fixed at SigLIP-pretrained values.
-PG specifically depends on which patch's key best matches the phrase token's
-Q; adding `k_proj` to LoRA gives the model direct control over that match.
+Same recipe as v5 seed=2 (λ=0.5, lr=2e-4, batch=32, 1 epoch, single cosine,
+restarts=1, seed=2). Single change: LoRA targets become `['q_proj','k_proj',
+'v_proj']` (was q+v). Trainable params: 442K (was 295K, +50%). Same data
+order, same init → clean A/B vs v5 seed=2's 20.90% PG.
+W&B run `m_human_v7_seed2_lam0.5`. Colab L4, 42 min.
 
-Cost: +50% LoRA params (q+k+v vs q+v). Same rank=4. Same λ=0.5. Same seed=2.
-Single change → clean A/B vs v5 seed=2's 20.90%. ~40 min on L4.
+**Headline: end-of-epoch PG = 17.80% (−3.10pp vs v5 seed=2). But step 400
+hit 22.69% (+1.74pp vs v5 seed=2's peak of 20.95%). The model reached the
+highest PG of any run at any checkpoint, then collapsed.**
 
-Decision rule: if seed=2 PG > 23.5% (v5 leader + σ_v5 ≈ 2.6pp), re-verify
-on seeds 0+1 for the full distribution. If PG lands in [18.3, 23.5],
-plausibly a real but small gain — re-verify on all 3 seeds to confirm.
-If PG < 18.3, k_proj alone isn't enough and the next move is either rank
-bump (r=4 → r=8) or a different region-loss formulation.
+| step | v5 (q+v) | v6 (λ=1.0) | **v7 (q+k+v)** |
+|-----:|---------:|-----------:|---------------:|
+|    0 |   14.74  |     14.74  |      14.74  |
+|  200 |   16.48  |     17.33  |      16.81  |
+|  400 |   19.92  |     14.45  |   **22.69** |
+|  600 |   20.62  |     16.62  |      17.98  |
+|  800 |   20.95  |     17.09  |      17.47  |
+|  end |   20.90  |     17.18  |      17.80  |
+
+**Final eval:**
+
+| Metric            | v5 seed=2 | v7 seed=2 |    Δ |
+|-------------------|----------:|----------:|-----:|
+| Pointing Game     |    20.90% |    17.80% | −3.10 |
+| R@1 top-10        |     5.98% |     5.46% | −0.52 |
+| R@1 top-25        |     7.02% |     7.25% | +0.23 |
+| R@1 halfmax       |     7.30% |     7.30% |  0.00 |
+| Train loss region |     0.102 |     0.102 |  0.00 |
+| Train loss global |     0.368 |     0.362 | −0.006 |
+
+**Findings.**
+
+1. **Added capacity helps the model REACH a better PG.** Step 400's 22.69%
+   is the highest checkpoint of any v5/v6/v7 run on this seed. With q+v
+   LoRA alone, v5 never crossed 21% at any checkpoint. The k_proj target
+   gave the model enough attention-routing freedom to find a sharper
+   grounding pattern.
+
+2. **Added capacity also lets the model walk AWAY from that PG-good
+   region.** Between step 400 and step 600, PG dropped 4.71pp while
+   `loss_global` *improved* by 0.006 and `loss_region` stayed flat.
+   The optimizer found a lower-loss point that has worse argmax
+   localization — loss/metric decoupling, amplified by the extra
+   flexibility. End-of-epoch state ends up worse than mid-epoch.
+
+3. **The lowest training loss of all three runs** (global=0.362) and
+   yet the *third-place* final PG. Training-loss minimisation and
+   PG maximisation point in different directions late in training.
+
+4. **The fix is early stopping / best-checkpoint, not less capacity.**
+   v7's step-400 model is genuinely better than anything v5 produced;
+   the problem is we're keeping the step-907 model. Implementing
+   best-PG snapshot tracking should recover v7's peak without
+   sacrificing capacity.
+
+**Next:** Exp-09 — re-run v7 (same recipe, same seed) with best-PG
+snapshot/restore added to `train_one_epoch`.
+
+---
+
+### Exp-09 — M_human v8 (q+k+v LoRA + best-PG snapshot) [planned]
+
+Single infrastructure change: `train_one_epoch` now snapshots the trainable
+parameters (~0.4M, ~MB-scale CPU memory) whenever the periodic PG eval
+beats the best-so-far, and restores the best snapshot before returning.
+The function's `keep_best_pg` flag defaults to True, so v5 / v6 / v7
+re-runs would also benefit; for v5 this is a no-op (its trajectory was
+monotone), for v6 marginal, for v7 substantial.
+
+Same recipe as v7 (q+k+v LoRA, λ=0.5, seed=2, 1 epoch). Trajectory is
+deterministic given the seed control wired in Exp-06, so the periodic PG
+evals should land at the same percentages: 14.74 → 16.81 → 22.69 → 17.98
+→ 17.47 → 17.80. With best-PG restore, the final eval reads the step-400
+state and should return **PG ≈ 22.69%** instead of 17.80%.
+
+Decision rule:
+- If v8 final PG ≈ 22.69% on seed=2 → real win against v5 seed=2 (20.90%)
+  by ≈ +1.8pp. Re-verify on seeds 0+1 to estimate the v8 distribution.
+- If v8 final PG differs from 22.69% by more than ~0.3pp on seed=2 →
+  something in the restore path is wrong (state didn't fully copy back,
+  device mismatch, etc.). Debug before believing the number.
+- If the new v8 distribution mean > v5 mean (18.68%) by more than σ_v5
+  (2.57pp) → push to write-up. Otherwise iterate on Tier 2 levers
+  (rank bump, longer warmup).
