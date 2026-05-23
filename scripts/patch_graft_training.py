@@ -77,6 +77,114 @@ NB_PATH = Path(__file__).resolve().parent.parent / 'notebooks' / 'graft-training
 
 PG_EVAL_MARKER = '# ── 8b. Quick Pointing Game + Recall@1 eval (Flickr30k) ──'
 
+DATASET_MARKER = '# ── 4. Dataset'
+
+DATASET_SRC = '''# ── 4. Dataset ────────────────────────────────────────────────────────────────
+# Per-image dataset. Returns (pil, caption, orig_size, [(phrase, bbox), ...]).
+#
+# 90-10 train-test split on the Flickr30k train images (split_seed=42, fixed):
+#   - train_ds : 90% of train images (the LoRA sees these gradients).
+#   - test_ds  : 10% of train images held out from training. Never seen by
+#                the model during training; not the same set as val_ds.
+#                Used ONCE per run, after best-PG restore, to report the
+#                real generalisation PG/R@1.
+#   - val_ds   : full Flickr30k val split. quick_pointing_game_eval samples
+#                n_images=CFG["eval_images"]=200 of these as the best-PG
+#                snapshot signal during training and for the val-PG number
+#                in the per-seed table.
+# Split is deterministic in split_seed and the underlying hf_data row order;
+# do NOT change split_seed across experiments or the test set will shift.
+
+import random as _split_random
+
+
+def make_train_test_split(hf_data, split='train', test_frac=0.10, split_seed=42):
+    """Deterministic 90-10 partition of a Flickr30k split by filename.
+    Returns (train_filenames_set, test_filenames_set)."""
+    filenames = sorted([r['filename'] for r in hf_data if r['split'] == split])
+    rng = _split_random.Random(split_seed)
+    rng.shuffle(filenames)
+    n_test = int(round(len(filenames) * test_frac))
+    test_filenames  = set(filenames[:n_test])
+    train_filenames = set(filenames[n_test:])
+    return train_filenames, test_filenames
+
+
+class FlickrSigLIPDataset(Dataset):
+    """One item per image. Returns (pil, caption, orig_size, phrase_boxes).
+    Optionally filters to a subset of filenames via image_ids."""
+
+    def __init__(self, hf_data, ann_dir: Path, sent_dir: Path,
+                 split: str = 'train', image_ids=None):
+        self.ann_dir  = ann_dir
+        self.sent_dir = sent_dir
+        rows = [r for r in hf_data if r['split'] == split]
+        if image_ids is not None:
+            id_set = set(image_ids)
+            rows = [r for r in rows if r['filename'] in id_set]
+        self.rows = rows
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, idx):
+        row = self.rows[idx]
+
+        # decode PIL image
+        img_field = row['image']
+        if isinstance(img_field, PILImage.Image):
+            pil = img_field.convert('RGB')
+        else:
+            pil = PILImage.open(io.BytesIO(img_field['bytes'])).convert('RGB')
+        orig_size = pil.size  # (W, H)
+
+        caption = random.choice(row['caption'])
+
+        # phrase-bbox pairs from Entities annotations
+        stem = row['filename'].replace('.jpg', '')
+        try:
+            anns  = get_annotations(str(self.ann_dir  / f'{stem}.xml'))
+            sents = get_sentence_data(str(self.sent_dir / f'{stem}.txt'))
+        except Exception:
+            return pil, caption, orig_size, []
+
+        phrase_boxes = []
+        seen = set()
+        for sent in sents:
+            for phrase in sent['phrases']:
+                pid = phrase['phrase_id']
+                if pid in seen or pid not in anns['boxes']:
+                    continue
+                seen.add(pid)
+                for box in anns['boxes'][pid]:
+                    phrase_boxes.append((phrase['phrase'], box))
+
+        return pil, caption, orig_size, phrase_boxes
+
+    @staticmethod
+    def collate_fn(batch):
+        pils, captions, orig_sizes, phrase_boxes = zip(*batch)
+        return list(pils), list(captions), list(orig_sizes), list(phrase_boxes)
+
+
+TRAIN_IDS, TEST_IDS = make_train_test_split(
+    hf_data, split='train', test_frac=0.10, split_seed=42,
+)
+train_ds = FlickrSigLIPDataset(hf_data, ANN_DIR, SENT_DIR, split='train', image_ids=TRAIN_IDS)
+test_ds  = FlickrSigLIPDataset(hf_data, ANN_DIR, SENT_DIR, split='train', image_ids=TEST_IDS)
+val_ds   = FlickrSigLIPDataset(hf_data, ANN_DIR, SENT_DIR, split='val')
+
+print(f'Train (90% of train): {len(train_ds):,} images')
+print(f'Test  (10% of train, held out): {len(test_ds):,} images')
+print(f'Val   (Flickr30k val): {len(val_ds):,} images')
+
+# Sanity check one sample
+pil0, cap0, sz0, pb0 = train_ds[0]
+print(f'\\nSample: size={sz0}  caption="{cap0[:60]}..."')
+print(f'phrase-box pairs: {len(pb0)}  e.g. {pb0[0] if pb0 else "none"}')
+'''
+
+
 FEATURE_HELPERS_SRC = '''# ── 7. Feature extraction helpers ─────────────────────────────────────────────
 import types
 
@@ -175,6 +283,11 @@ print('Feature extraction helpers defined (with MaskCLIP bypass).')
 PG_EVAL_SRC = '''# ── 8b. Quick Pointing Game + Recall@1 eval (Flickr30k) ──────────────────────
 # Same protocol as 06_pointing_game_eval.ipynb so trained-model numbers are
 # directly comparable to B0 = 14.74% (PG) / 6.83% (R@1 top-10) / 7.91% (top-25).
+# Both eval functions accept an optional rows=<list> kwarg: when provided,
+# eval runs on those exact rows (no sub-sampling). When omitted, samples
+# n_images rows from the Flickr30k val split (default behaviour used by
+# best-PG snapshot and final val-set reporting). Used for the 90-10 train-test
+# split test eval: pass rows=test_ds.rows for the held-out test set.
 
 _pg_val_rows = None
 
@@ -211,13 +324,17 @@ def _row_to_pil(row):
     return PILImage.open(io.BytesIO(img['bytes'])).convert('RGB')
 
 
-def quick_pointing_game_eval(model, processor, n_images=200, seed=42, device=DEVICE):
-    """Flickr30k Pointing Game on val split. MaskCLIP-style last-attention bypass.
+def quick_pointing_game_eval(model, processor, n_images=200, seed=42, device=DEVICE,
+                              rows=None):
+    """Flickr30k Pointing Game. MaskCLIP-style last-attention bypass.
+    When rows is None, samples n_images from the val split (default).
+    When rows is a list, evaluates on every row (no sampling).
     Returns (acc_pct, n_correct, n_total)."""
     model.eval()
-    rows = _get_pg_val_rows()
-    rng  = random.Random(seed)
-    rows = rng.sample(rows, min(n_images, len(rows)))
+    if rows is None:
+        rows = _get_pg_val_rows()
+        rng  = random.Random(seed)
+        rows = rng.sample(rows, min(n_images, len(rows)))
 
     n_side    = CFG['n_side']
     eval_size = CFG['eval_size']
@@ -288,12 +405,15 @@ def _iou(a, b):
 
 
 def quick_recall1_eval(model, processor, n_images=200, seed=42,
-                        iou_thresh=0.5, device=DEVICE):
-    """Flickr30k Recall@1 @ IoU >= iou_thresh on val. Returns dict for top10/top25/halfmax."""
+                        iou_thresh=0.5, device=DEVICE, rows=None):
+    """Flickr30k Recall@1 @ IoU >= iou_thresh. When rows is None, samples
+    n_images from the val split (default). When rows is a list, evaluates
+    on every row (no sampling). Returns dict for top10/top25/halfmax."""
     model.eval()
-    rows = _get_pg_val_rows()
-    rng  = random.Random(seed)
-    rows = rng.sample(rows, min(n_images, len(rows)))
+    if rows is None:
+        rows = _get_pg_val_rows()
+        rng  = random.Random(seed)
+        rows = rng.sample(rows, min(n_images, len(rows)))
 
     n_side    = CFG['n_side']
     eval_size = CFG['eval_size']
@@ -685,13 +805,13 @@ TRAIN_MH_SRC = '''# ── 10. Train M_human ───────────�
 # (added capacity in v7/v8/v9 correlated with drift); keeps best-PG snapshot
 # as free insurance.
 
-SEEDS           = [0, 1]             # v10 variance check (seed=2 already done @ 21.23%)
+SEEDS           = [0, 1, 2]          # v10 generalisation test on 90-10 split
 LAMBDA_OVERRIDE = None               # keep λ=0.5 (proven)
-LORA_TARGETS    = ['q_proj', 'v_proj']   # v10: revert to v5's most-stable target set
-REGION_TOP_K    = None               # v10: pure max-pool over patches (k=1 / FILIP-shape)
-PHRASE_REPR     = 'eos'              # v10: NEW. 'eos' aligns with eval; 'tokens' = FILIP behaviour
-EXPERIMENT_TAG  = 'v10'              # used in W&B run name + checkpoint path
-CFG['epochs']   = 1                  # match v2; single cosine, restarts=1.
+LORA_TARGETS    = ['q_proj', 'v_proj']   # locked v10: q+v
+REGION_TOP_K    = None               # locked v10: pure max-pool over patches
+PHRASE_REPR     = 'eos'              # locked v10: EOS phrase repr (matches eval)
+EXPERIMENT_TAG  = 'v10_split90'      # locked v10 recipe on 90% of train; 10% held out as test_ds
+CFG['epochs']   = 1                  # locked v10: single cosine, restarts=1.
 
 if REGION_TOP_K is not None:
     CFG['region_top_k'] = REGION_TOP_K
@@ -806,13 +926,24 @@ for seed in SEEDS:
         dataloader_gen= dl_gen,
     )
 
-    # Final PG + R@1 on the same val protocol as B0.
+    # Final PG + R@1 on the val split (same protocol as B0, n_images=200).
     pg_acc, pg_c, pg_t = quick_pointing_game_eval(
         model_mh, processor, n_images=CFG['eval_images'], seed=42, device=DEVICE,
     )
     r1 = quick_recall1_eval(
         model_mh, processor, n_images=CFG['eval_images'], seed=42, device=DEVICE,
     )
+
+    # Held-out test eval: full 10% of train (~2,978 images), never seen by
+    # training and not the same set as the best-PG snapshot signal. Runs on
+    # the best-PG-restored model state.
+    test_pg, test_pg_c, test_pg_t = quick_pointing_game_eval(
+        model_mh, processor, seed=42, device=DEVICE, rows=test_ds.rows,
+    )
+    test_r1 = quick_recall1_eval(
+        model_mh, processor, seed=42, device=DEVICE, rows=test_ds.rows,
+    )
+    print(f'  Seed {seed} TEST PG: {test_pg:.2f}%  ({test_pg_c}/{test_pg_t})')
 
     model_mh.save_pretrained(
         f'{CFG["ckpt_dir"]}/mhuman_{EXPERIMENT_TAG}_seed{seed}_lam{CFG["lambda_region"]}'
@@ -825,6 +956,11 @@ for seed in SEEDS:
         'recall1_top10':   r1['top10'][0],
         'recall1_top25':   r1['top25'][0],
         'recall1_halfmax': r1['halfmax'][0],
+        'test_pg':         test_pg,
+        'test_recall1_top10':   test_r1['top10'][0],
+        'test_recall1_top25':   test_r1['top25'][0],
+        'test_recall1_halfmax': test_r1['halfmax'][0],
+        'test_n_phrases':       test_pg_t,
         'loss':            stats_ep['loss'],
         'global':          stats_ep['global'],
         'region':          stats_ep['region'],
@@ -833,13 +969,17 @@ for seed in SEEDS:
     })
 
     wandb.log({
-        'eval/mhuman_pointing_game'    : pg_acc,
-        'eval/mhuman_recall1_top10'    : r1['top10'][0],
-        'eval/mhuman_recall1_top25'    : r1['top25'][0],
-        'eval/mhuman_recall1_halfmax'  : r1['halfmax'][0],
-        'mhuman/final_loss'            : stats_ep['loss'],
-        'mhuman/final_loss_global'     : stats_ep['global'],
-        'mhuman/final_loss_region'     : stats_ep['region'],
+        'eval/mhuman_pointing_game'      : pg_acc,
+        'eval/mhuman_recall1_top10'      : r1['top10'][0],
+        'eval/mhuman_recall1_top25'      : r1['top25'][0],
+        'eval/mhuman_recall1_halfmax'    : r1['halfmax'][0],
+        'eval/mhuman_test_pointing_game' : test_pg,
+        'eval/mhuman_test_recall1_top10' : test_r1['top10'][0],
+        'eval/mhuman_test_recall1_top25' : test_r1['top25'][0],
+        'eval/mhuman_test_recall1_halfmax': test_r1['halfmax'][0],
+        'mhuman/final_loss'              : stats_ep['loss'],
+        'mhuman/final_loss_global'       : stats_ep['global'],
+        'mhuman/final_loss_region'       : stats_ep['region'],
     }, step=ep_steps)
     wandb.summary.update({
         'seed'                : seed,
@@ -847,10 +987,15 @@ for seed in SEEDS:
         'recall1_top10'       : r1['top10'][0],
         'recall1_top25'       : r1['top25'][0],
         'recall1_halfmax'     : r1['halfmax'][0],
+        'test_pointing_game'  : test_pg,
+        'test_recall1_top10'  : test_r1['top10'][0],
+        'test_recall1_top25'  : test_r1['top25'][0],
+        'test_recall1_halfmax': test_r1['halfmax'][0],
+        'test_n_phrases'      : test_pg_t,
     })
     wandb.finish()
 
-    print(f'  Seed {seed} final PG: {pg_acc:.2f}%  ({pg_c}/{pg_t})')
+    print(f'  Seed {seed} final val PG: {pg_acc:.2f}%  ({pg_c}/{pg_t})')
 
 # Cross-seed summary (printed here AND aggregated more fully in cell 11).
 pg_vals = np.array([r['pg_acc'] for r in v5_results])
@@ -887,36 +1032,50 @@ MH_V5 = dict(   # locked v5 baseline (Exp-06, λ=0.5, n=3 seeds)
     recall1_halfmax =  7.30,
 )
 
-pg_vals  = np.array([r['pg_acc']          for r in v5_results])
-r10_vals = np.array([r['recall1_top10']   for r in v5_results])
-r25_vals = np.array([r['recall1_top25']   for r in v5_results])
-rhm_vals = np.array([r['recall1_halfmax'] for r in v5_results])
+pg_vals      = np.array([r['pg_acc']          for r in v5_results])
+r10_vals     = np.array([r['recall1_top10']   for r in v5_results])
+r25_vals     = np.array([r['recall1_top25']   for r in v5_results])
+rhm_vals     = np.array([r['recall1_halfmax'] for r in v5_results])
+has_test     = all('test_pg' in r for r in v5_results)
+test_pg_vals = np.array([r.get('test_pg', np.nan) for r in v5_results]) if has_test else None
+test_rhm_vals= np.array([r.get('test_recall1_halfmax', np.nan) for r in v5_results]) if has_test else None
 
 print('=' * 110)
 print(f'  M_human {EXPERIMENT_TAG}  —  {len(v5_results)} seed(s), 1 epoch, λ={CFG["lambda_region"]}')
 print('=' * 110)
-print(f'  {"seed":>5} | {"PG":>8} | {"best PG":>8} | {"@step":>6} | '
+print(f'  {"seed":>5} | {"val PG":>8} | {"test PG":>8} | {"best PG":>8} | {"@step":>6} | '
       f'{"R@1 top-10":>12} | {"R@1 top-25":>12} | {"R@1 halfmax":>13} | {"loss":>7}')
 print('-' * 110)
 for r in v5_results:
     bp = r.get('best_pg', r['pg_acc'])
     bs = r.get('best_step', -1)
-    print(f'  {r["seed"]:>5} | {r["pg_acc"]:7.2f}% | {bp:7.2f}% | {bs:>6d} | '
+    tp = r.get('test_pg', float('nan'))
+    print(f'  {r["seed"]:>5} | {r["pg_acc"]:7.2f}% | {tp:7.2f}% | {bp:7.2f}% | {bs:>6d} | '
           f'{r["recall1_top10"]:11.2f}% | {r["recall1_top25"]:11.2f}% | '
           f'{r["recall1_halfmax"]:12.2f}% | {r["loss"]:7.3f}')
 print('-' * 110)
 
 pg_mean = float(pg_vals.mean())
+test_pg_mean = float(test_pg_vals.mean()) if has_test else float('nan')
 if len(pg_vals) >= 2:
     pg_std = float(pg_vals.std(ddof=1))
+    test_pg_std = float(test_pg_vals.std(ddof=1)) if has_test else float('nan')
     def _agg(vals):
         return f'{vals.mean():.2f} ± {vals.std(ddof=1):.2f}'
-    print(f'  mean± | {_agg(pg_vals):>7}% | {_agg(r10_vals):>11}% | '
+    print(f'  val mean± | {_agg(pg_vals):>7}% | {_agg(r10_vals):>11}% | '
           f'{_agg(r25_vals):>11}% | {_agg(rhm_vals):>12}% |')
-    print(f'  range | [{pg_vals.min():.2f}, {pg_vals.max():.2f}]  '
+    print(f'  val range | [{pg_vals.min():.2f}, {pg_vals.max():.2f}]  '
           f'(spread = {pg_vals.max() - pg_vals.min():.2f}pp)')
+    if has_test:
+        print(f'  test mean±: PG = {_agg(test_pg_vals):>7}%  '
+              f'(n_phrases ≈ {int(v5_results[0]["test_n_phrases"]):,})')
+        print(f'  test range: [{test_pg_vals.min():.2f}, {test_pg_vals.max():.2f}]  '
+              f'(spread = {test_pg_vals.max() - test_pg_vals.min():.2f}pp)')
+        print(f'  val→test delta (mean): {test_pg_mean - pg_mean:+.2f}pp  '
+              f'(positive = test PG higher than val PG; ~0 = no overfitting to val)')
 else:
     pg_std = float('nan')
+    test_pg_std = float('nan')
     print(f'  (single seed — no std)')
 print('=' * 96)
 
@@ -945,7 +1104,7 @@ agg_run = wandb.init(
     tags    = ['siglip', 'flickr30k', 'lora', 'm_human', EXPERIMENT_TAG, 'aggregate'],
     reinit  = True,
 )
-wandb.summary.update({
+_summary = {
     'experiment_tag'    : EXPERIMENT_TAG,
     'lambda_region'     : CFG['lambda_region'],
     'seeds_n'           : len(v5_results),
@@ -959,7 +1118,17 @@ wandb.summary.update({
     'delta_vs_b0'       : pg_mean - B0['pointing_game'],
     'delta_vs_v5_mean'  : pg_mean - MH_V5['pg_mean'],
     'delta_vs_v5_leader': pg_mean - MH_V5['pg_seed2_leader'],
-})
+}
+if has_test:
+    _summary.update({
+        'test_pg_mean'       : test_pg_mean,
+        'test_pg_std'        : test_pg_std,
+        'test_pg_min'        : float(test_pg_vals.min()),
+        'test_pg_max'        : float(test_pg_vals.max()),
+        'test_delta_vs_b0'   : test_pg_mean - B0['pointing_game'],
+        'test_minus_val_pg'  : test_pg_mean - pg_mean,
+    })
+wandb.summary.update(_summary)
 wandb.finish()
 print('Aggregate W&B run finished.')
 '''
@@ -994,6 +1163,14 @@ def main():
     cells[fh_idx]['outputs'] = []
     cells[fh_idx]['execution_count'] = None
     print(f'Rewrote feature-helpers cell at index {fh_idx}')
+
+    # ── 0b. Rewrite dataset cell (adds 90-10 train-test split + image_ids filter)
+    ds_idx = next(i for i, c in enumerate(cells)
+                  if first_line(c).startswith(DATASET_MARKER))
+    cells[ds_idx]['source'] = DATASET_SRC.splitlines(keepends=True)
+    cells[ds_idx]['outputs'] = []
+    cells[ds_idx]['execution_count'] = None
+    print(f'Rewrote dataset cell at index {ds_idx}')
 
     # ── 1. Insert PG eval cell after the VOC eval cell, if not already present ──
     voc_idx = next(i for i, c in enumerate(cells)
