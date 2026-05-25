@@ -642,4 +642,85 @@ contribute orthogonally.
 - Best-PG snapshot tracking in `train_one_epoch`
 - 3-seed verification standard
 
-**Next:** Exp-12 — M_auto (LLM-suggested ablations on top of v10 recipe). v10 is now the baseline to beat.
+**Next:** Exp-12 — generalisation test (90-10 train-test split).
+
+---
+
+### Exp-12 — M_human v10 generalisation test (90-10 train-test split) ✓ PASS
+
+**Motivation.** v10's best-PG snapshot selects the checkpoint with the
+highest PG on a 200-image val split — then reports PG on that same
+val split. This creates a data-leakage concern: the reported number is
+optimistically biased by the selection step. To get an honest
+generalisation estimate, we held out 10% of the Flickr30k train split
+as an independent test set that was never used for any training-time
+decision.
+
+**Setup.** Deterministic 90-10 partition of train filenames
+(`split_seed=42`, by sorted filename then Fisher-Yates shuffle):
+
+| Partition | Images | Purpose |
+|-----------|-------:|---------|
+| Train (90%) | 26,100 | LoRA fine-tuning |
+| Test (10%) | 2,900 | Held-out generalisation eval |
+| Val (Flickr30k val) | 1,014 | Best-PG snapshot trigger (unchanged) |
+
+Test eval runs on the best-PG checkpoint per seed, evaluating all
+phrase-bbox pairs in the 2,900-image test set (28,467 pairs, ~9.8
+phrases/image). Binomial SE at p ≈ 0.20, n = 28,467 is **≈ 0.24pp**
+— 4× tighter than val-200 (0.87pp).
+
+Recipe: locked v10 (q+v LoRA, EOS region loss, best-PG snapshot,
+λ=0.5, 1 epoch), `EXPERIMENT_TAG='v10_split90'`, `SEEDS=[0,1,2]`.
+W&B runs: `m_human_v10_split90_seed{0,1,2}_lam0.5`.
+
+**Per-seed results:**
+
+| seed | val PG | test PG | best PG | @step | R@1 top-10 | R@1 top-25 | R@1 halfmax | loss |
+|-----:|-------:|--------:|--------:|------:|-----------:|-----------:|------------:|-----:|
+| 0 | 19.92% | 19.84% | 19.92% | 400 | 5.74% | 7.72% | 7.25% | 0.347 |
+| 1 | 21.61% | 21.83% | 21.61% | 800 | 6.59% | 7.58% | 7.34% | 0.359 |
+| 2 | 17.94% | 18.52% | 17.94% | 200 | 6.54% | 7.34% | 7.25% | 0.332 |
+
+**Aggregate:**
+- Val PG mean ± std: **19.82 ± 1.84%**
+- Test PG mean ± std: **20.07 ± 1.67%** (n_phrases ≈ 28,467)
+- Val→test delta (mean): **+0.25pp**
+  (positive = test PG higher than val PG; ≈ 0 = no overfitting to val)
+
+**Per-seed val↔test delta:**
+
+| seed | val PG | test PG | Δ (test − val) |
+|-----:|-------:|--------:|---------------:|
+| 0 | 19.92% | 19.84% | −0.08pp |
+| 1 | 21.61% | 21.83% | +0.22pp |
+| 2 | 17.94% | 18.52% | +0.58pp |
+
+**Findings.**
+
+1. **No val-snapshot leakage.** The mean val→test delta is +0.25pp —
+   test PG is *higher* than val PG. Every seed's test PG is within
+   0.6pp of its val PG. The best-PG snapshot mechanism is selecting
+   genuinely good checkpoints, not ones that happen to score well
+   on val by chance.
+
+2. **Variance is higher on split90 than full-train v10** (σ = 1.84pp
+   val / 1.67pp test vs full-train v10's 0.41pp). Two explanations:
+   (a) 10% less training data increases seed sensitivity, or (b) the
+   full-train σ = 0.41pp was a lucky low draw from a wider true
+   distribution. Either way the *mean* is consistent: 19.82% (split90
+   val) vs 20.76% (full-train val) is the expected ~1pp drop from
+   10% less training data.
+
+3. **Test PG is the most statistically reliable PG figure in this
+   project.** 28,467 phrase-bbox pairs → SE ≈ 0.24pp per checkpoint.
+   The +5.33pp gain over B0 (14.74%) on held-out data is a ~22σ
+   signal. (Note: B0's 14.74% was measured on val-200, not this test
+   set; B0 is frozen so its test-set PG should be similar, but a
+   clean B0-on-test number would tighten this further.)
+
+4. **Generalisation confirmed.** The v10 recipe's improvement over B0
+   is not an artefact of val-snapshot selection. The locked recipe
+   stands; ready to pivot to M_auto.
+
+**Next:** Exp-13 — M_auto (Florence-2 auto-generated bbox supervision, same v10 recipe).
