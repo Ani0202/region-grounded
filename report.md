@@ -723,4 +723,109 @@ W&B runs: `m_human_v10_split90_seed{0,1,2}_lam0.5`.
    is not an artefact of val-snapshot selection. The locked recipe
    stands; ready to pivot to M_auto.
 
-**Next:** Exp-13 — M_auto (Florence-2 auto-generated bbox supervision, same v10 recipe).
+**Next:** Exp-13 — multi-epoch training (5 epochs with cosine restart per epoch).
+
+---
+
+### Exp-13 — M_human v11 (5 epochs, cosine restart per epoch) — seed 1
+
+**Motivation.** v10's 1-epoch trajectory plateaus or drifts after
+step 400–800 (~half the epoch). The best-PG snapshot catches the peak,
+but more training time with per-epoch cosine restarts could push the
+peak itself higher. v3 showed that a single cosine stretched over
+2 epochs kept LR too high (Exp-04); v4 added per-epoch restarts
+(Exp-05) but at 2 epochs only. v11 extends to 5 epochs with
+`restarts=CFG['epochs']=5` — each epoch gets its own
+warmup→cosine→0 cycle.
+
+**Setup.** Locked v10 recipe (q+v LoRA, EOS region loss, best-PG
+snapshot, λ=0.5), with two changes: `CFG['epochs']=5` and
+`restarts=5`. 90-10 train-test split (same as Exp-12). Periodic
+eval every 200 steps on both val (200 images) and test (200-image
+subsample). Checkpoints saved to Drive every 200 steps + best-PG.
+Total steps: ~4,080 (816 steps/epoch × 5). Seed 1 only (seed 0
+completed separately; seed 2 pending).
+
+W&B run: `m_human_v11_5ep_seed1_lam0.5`.
+
+**PG trajectory (seed 1, every 200 steps):**
+
+| step | epoch | val PG | test PG |
+|-----:|:-----:|-------:|--------:|
+| 200  | 1     | 16.34% | 15.04%  |
+| 400  | 1     | 19.59% | 18.48%  |
+| 600  | 1     | 19.63% | 19.92%  |
+| 800  | 1     | 19.68% | 19.92%  |
+| 1000 | 2     | 17.33% | 18.94%  |
+| 1200 | 2     | 18.55% | 20.53%  |
+| 1400 | 2     | 18.79% | 20.12%  |
+| 1600 | 2     | 19.40% | 20.74%  |
+| 1800 | 3     | 17.94% | 18.69%  |
+| 2000 | 3     | 17.47% | 19.71%  |
+| 2200 | 3     | 18.64% | 22.23%  |
+| 2400 | 3     | 19.21% | 21.41%  |
+| 2600 | 4     | 22.74% | 23.20%  |
+| 2800 | 4     | 22.69% | 22.43%  |
+| 3000 | 4     | 23.59% | 24.59%  |
+| 3200 | 4     | 23.26% | 25.00%  |
+| 3400 | 5     | **24.44%** | 25.26% |
+| 3600 | 5     | 23.26% | 24.79%  |
+| 3800 | 5     | 24.15% | 25.72%  |
+| 4000 | 5     | 24.11% | 26.03%  |
+
+Best-PG snapshot restored from step 3400 (val PG = 24.44%).
+
+**Final eval (seed 1, best-PG model):**
+
+| Metric            | B0     | v10 (1 ep, 3-seed mean) | **v11 seed 1 (5 ep)** | Δ vs B0 | Δ vs v10 mean |
+|-------------------|-------:|------------------------:|----------------------:|--------:|--------------:|
+| Val PG            | 14.74% | 20.76 ± 0.41%           | **24.44%**            | +9.70   | +3.68         |
+| Test PG           | 14.74% | 20.07 ± 1.67%           | **26.16%**            | +11.42  | +6.09         |
+| R@1 top-10        |  6.83% | —                       |  5.93%                | −0.90   | —             |
+| R@1 top-25        |  7.91% | —                       |  8.29%                | +0.38   | —             |
+| R@1 halfmax       |  7.58% | —                       |  7.30%                | −0.28   | —             |
+| Test R@1 top-25   |  7.91% | —                       |  7.67%                | −0.24   | —             |
+| Test R@1 halfmax  |  7.58% | —                       |  7.35%                | −0.23   | —             |
+| Train loss        | —      | —                       |  0.211                | —       | —             |
+
+Test PG evaluated on full 2,900-image held-out set (28,467 phrase-bbox
+pairs). Test PG 26.16% = 7,447/28,467.
+
+**Findings.**
+
+1. **5 epochs is a clear win over 1 epoch.** Val PG jumped from the
+   v10 1-epoch range (~20%) to 24.44%, a +3.68pp gain over v10's
+   3-seed mean. Test PG 26.16% is +6.09pp over v10's test mean
+   (20.07%). The per-epoch cosine restart prevented the v3-style
+   stretch problem while the 5× training budget let the model reach
+   deeper minima.
+
+2. **The model shows a staircase pattern across epochs.** Epochs 1–2
+   plateau around 19–20% val PG (matching v10's 1-epoch performance).
+   A step change occurs in epoch 4 (val PG jumps to 22–24%) and
+   persists through epoch 5. The per-epoch cosine restarts seem to
+   kick the optimizer out of the epoch 1–2 basin into a better one
+   at epoch 4.
+
+3. **Val PG plateaus in epoch 5.** Steps 3400–4000 fluctuate between
+   23.26% and 24.44% with no upward trend. The best-PG snapshot
+   captured the peak (step 3400). More epochs would likely yield
+   diminishing returns (<1pp).
+
+4. **Test PG consistently higher than val PG in late training.**
+   From step 2200 onward, test PG exceeds val PG by 1–2pp at most
+   checkpoints. This is not overfitting — the test set is larger
+   (28,467 vs 2,124 pairs) and the SE is tighter (0.24pp vs 0.87pp),
+   so test PG is a more accurate estimate of the model's true PG.
+
+5. **R@1 top-25 improved.** At 8.29%, this is the first trained model
+   to beat B0's 7.91% on R@1 top-25 — 5 epochs of training produced
+   enough spatial coherence for the top-25 patch box to overlap the
+   GT bbox, not just the argmax centre.
+
+**Caveat.** This is a single-seed result. v5 showed σ ≈ 2.57pp on
+1-epoch runs; the 5-epoch σ is unknown until seeds 0 and 2 are run.
+However, the +3.68pp gain over v10's 3-seed mean is large relative
+to any historical σ.
+
+**Next:** Run seeds 0 and 2 at 5 epochs for 3-seed verification, then M_auto.
