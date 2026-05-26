@@ -767,6 +767,15 @@ def train_one_epoch(model, processor, train_ds, lambda_region,
 
             if ckpt_save_dir is not None:
                 model.save_pretrained(f'{ckpt_save_dir}/step_{global_step}')
+                _log_path = f'{ckpt_save_dir}/eval_log.txt'
+                with open(_log_path, 'a') as _f:
+                    _f.write(f'step {global_step:4d}  val PG = {pg_acc:.2f}%  '
+                             f'({pg_correct}/{pg_total})  [B0=14.74%]\\n')
+                    if test_eval_rows is not None:
+                        _f.write(f'step {global_step:4d}  test PG = {t_pg:.2f}%  '
+                                 f'({t_c}/{t_t})\\n')
+                    if keep_best_pg and pg_acc >= best_pg:
+                        _f.write(f'  >> new best PG = {pg_acc:.2f}%\\n')
 
             model.train()
 
@@ -832,7 +841,7 @@ TRAIN_MH_SRC = '''# ── 10. Train M_human ───────────�
 # (added capacity in v7/v8/v9 correlated with drift); keeps best-PG snapshot
 # as free insurance.
 
-SEEDS           = [0, 1, 2]          # 3-seed verification
+SEEDS           = [1]                # resume: seed 0 done, run seed 1 only
 LAMBDA_OVERRIDE = None               # keep λ=0.5 (proven)
 LORA_TARGETS    = ['q_proj', 'v_proj']   # locked v10: q+v
 REGION_TOP_K    = None               # locked v10: pure max-pool over patches
