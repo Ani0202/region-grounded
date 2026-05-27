@@ -48,8 +48,7 @@ report/*.toc
 report/*.bbl
 report/*.blg
 
-# Compiled PDF (regenerated from .tex — remove this line to track the PDF)
-report/*.pdf
+
 
 # NeurIPS style file (download from neurips.cc — not ours to commit)
 report/neurips_2024.sty
