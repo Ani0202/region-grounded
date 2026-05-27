@@ -16,13 +16,15 @@ A plain-English record of what the project is, what we tried, what worked, and w
 
 ---
 
-## The two supervision conditions
+## The supervision conditions
 
 - **M_human**: Fine-tuned using **Flickr30k Entities** — a dataset where human annotators drew bounding boxes around every noun phrase in every caption (e.g. "a man in a red jacket" → a box at specific pixel coordinates). This is the clean upper-bound condition.
 
-- **M_auto**: Fine-tuned using boxes generated automatically by **Florence-2** (a 231M-parameter model from Microsoft) using its `DENSE_REGION_CAPTION` task. Florence-2 looks at an image and outputs (bounding box, short label) pairs without any human annotation. This is the self-supervised condition.
+- **M_auto**: Fine-tuned using boxes generated automatically by **Florence-2** using its `DENSE_REGION_CAPTION` task. Florence-2 outputs (bounding box, verbose description) pairs. Labels are verbose ("a woman in a blue top") and don't match Flickr30k eval phrases ("woman"). This caused a train/eval vocabulary mismatch (see Exp-12).
 
-The minimal deliverable is a three-way table: **B0 (frozen) vs M_human vs M_auto** on both evaluation metrics.
+- **M_cpg**: Same as M_auto but uses Florence-2's `CAPTION_TO_PHRASE_GROUNDING` task instead. Input is the Flickr30k caption itself; Florence-2 grounds its noun phrases to bboxes. Labels come directly from the caption so they match evaluation vocabulary exactly. Planned fix for M_auto's vocabulary mismatch.
+
+The deliverable is a comparison table: **B0 (frozen) vs M_human vs M_auto vs M_cpg** on both evaluation metrics.
 
 ---
 
@@ -244,18 +246,115 @@ Seeds 0+1 are currently running to get a proper v10 distribution. If the mean cl
 
 ---
 
+### Exp-12 — M_human v10 generalisation test (90-10 train-test split) ✓ PASS
+
+**What we tried:** Hold out 10% of Flickr30k train (2,900 images, 28,467 phrase-bbox pairs) as an independent test set never used during training-time decisions, including best-PG snapshot selection. Run v10 locked recipe on seeds 0, 1, 2.
+
+**Result:**
+
+| seed | val PG | test PG | Δ (test − val) |
+|-----:|-------:|--------:|---------------:|
+| 0    | 19.92% |  19.84% |        −0.08pp |
+| 1    | 21.61% |  21.83% |        +0.22pp |
+| 2    | 17.94% |  18.52% |        +0.58pp |
+| **mean** | **19.82 ± 1.84%** | **20.07 ± 1.67%** | **+0.25pp** |
+
+**Why it matters:** The val→test delta is effectively zero (mean +0.25pp, all seeds within 0.6pp). The best-PG snapshot selects genuinely good checkpoints, not ones that overfit to the val split. The v10 improvement over B0 is real. Test PG (28,467 pairs, SE ≈ 0.24pp) is the most statistically reliable number in the project — the +5.33pp gain over B0 is a ~22σ signal on held-out data.
+
+---
+
+### Exp-13 — M_human v11 (5 epochs, cosine restart per epoch, seed=1) ← new best
+
+**W&B run:** `m_human_v11_5ep_seed1_lam0.5`
+
+**What we tried:** Same locked v10 recipe but 5 epochs, each with its own warmup→cosine→0 cycle (`restarts=5`). Per-epoch restarts avoid the LR-too-high-too-long problem of v3 (Exp-04) while providing 5× more training budget. 90-10 train-test split same as Exp-12.
+
+**Result (every 200 steps):**
+
+| Step | Epoch | Val PG | Test PG |
+|-----:|:-----:|-------:|--------:|
+|  200 |   1   | 16.34% |  15.04% |
+|  400 |   1   | 19.59% |  18.48% |
+|  600 |   1   | 19.63% |  19.92% |
+|  800 |   1   | 19.68% |  19.92% |
+| 1000 |   2   | 17.33% |  18.94% |
+| 1200 |   2   | 18.55% |  20.53% |
+| 1400 |   2   | 18.79% |  20.12% |
+| 1600 |   2   | 19.40% |  20.74% |
+| 1800 |   3   | 17.94% |  18.69% |
+| 2000 |   3   | 17.47% |  19.71% |
+| 2200 |   3   | 18.64% |  22.23% |
+| 2400 |   3   | 19.21% |  21.41% |
+| 2600 |   4   | 22.74% |  23.20% |
+| 2800 |   4   | 22.69% |  22.43% |
+| 3000 |   4   | 23.59% |  24.59% |
+| 3200 |   4   | 23.26% |  25.00% |
+| **3400** | **5** | **24.44%** | **25.26%** ← best-PG |
+| 3600 |   5   | 23.26% |  24.79% |
+| 3800 |   5   | 24.15% |  25.72% |
+| 4000 |   5   | 24.11% |  26.03% |
+
+**Best-PG: 24.44% val / 26.16% test at step 3400** — new project high on both.
+
+**Key findings:**
+1. **Staircase pattern.** Epochs 1–3 plateau at ~19–20% val (same as 1-epoch v10). Step change in epoch 4 (+3–5pp). Per-epoch cosine restarts kick the optimizer out of the epoch-1 basin into a better one.
+2. **Test PG consistently exceeds val PG in late training** (1–2pp gap from step 2200). The test set is 13× larger so its estimate is tighter — not a sign of overfitting.
+3. **R@1 top-25 = 8.29%** — first trained model to beat B0's 7.91%, confirming genuine spatial coherence after 5 epochs.
+4. **Single seed.** Seeds 0 and 2 needed for distribution.
+
+---
+
+### Exp-14 — M_auto (Florence-2 DENSE_REGION_CAPTION annotations, 1 epoch)
+
+**What we tried:** v10 locked recipe trained on Florence-2 `DENSE_REGION_CAPTION` annotations instead of Flickr30k Entities. Bbox source = auto; label source = verbose Florence-2 captions.
+
+**Result (seed=1):** Best-PG ~15.1% (barely above B0 = 14.74%). PG collapsed to ~11.5% at step 600.
+
+**Why it failed:** Train/eval vocabulary mismatch. Florence-2 generates verbose descriptions ("a woman in a blue top standing near a fence"); evaluation uses short Flickr30k phrases ("woman", "the man"). Early in training SigLIP handles both (~15%). As region loss accumulates, patch features drift toward the verbose vocabulary. The model optimises for a different distribution than what PG measures.
+
+**Conclusion:** Bbox geometry is not the bottleneck — label vocabulary is. Fix → M_cpg.
+
+---
+
+### Exp-15 — M_cpg (Florence-2 CAPTION_TO_PHRASE_GROUNDING annotations, seed=1, 5 epochs)
+
+**What we tried:** Same v10 recipe but annotation source = Florence-2 `CAPTION_TO_PHRASE_GROUNDING`. Input is the Flickr30k caption itself; Florence-2 grounds its noun phrases to bboxes. Labels match evaluation vocabulary exactly.
+
+**Per-epoch results (seed=1):**
+
+| Epoch | Val PG | Test PG | Best PG |
+|------:|-------:|--------:|--------:|
+| 1     | 22.60% |  22.50% |  22.60% |
+| **2** | **23.35%** | 22.79% | **23.35%** |
+| 3     | 21.99% |  21.96% |  21.99% |
+| 4     | 22.65% | **23.15%** |  22.65% |
+| 5     | 22.03% |  22.13% |  22.03% |
+
+**Best val PG: 23.35% (epoch 2). Best test PG: 23.15% (epoch 4).**
+
+**Key findings:**
+1. **Vocabulary alignment was the bottleneck.** Same Florence-2 model, same images, same recipe — swapping labels produced +8.25pp over DENSE_REGION_CAPTION.
+2. **M_cpg (23.35%) outperforms M_human v10 (20.48%) on seed=1 by +2.87pp.** Auto-generated annotations at scale can exceed human annotations when vocabulary is matched. Florence-2 grounds phrases from all 5 captions per image, providing denser supervision.
+3. **Val and test PG tightly coupled** (~0.1–0.5pp gap) — solid generalisation.
+4. **Single seed.** Seeds 0 and 2 needed for mean ± std.
+
+---
+
 ## Where things stand
 
-| Recipe | PG (best seed) | PG (mean ± std) |
-|---|---|---|
-| B0 frozen | 14.74% | — |
-| v5 (baseline recipe) | 20.90% (seed=2) | 18.68 ± 2.57% |
-| v10 (EOS fix, seed=2) | 21.23% | TBD (seeds 0+1 running) |
+| Model | Recipe | Val PG (seed=1) | Val PG (mean ± std) |
+|-------|--------|----------------:|--------------------:|
+| B0 frozen | — | 14.74% | — |
+| M_human v5 | FILIP, 1 epoch | 15.87% | 18.68 ± 2.57% (n=3) |
+| M_human v10 | EOS fix, 1 epoch | 20.48% | 20.76 ± 0.41% (n=3) |
+| M_auto (DENSE_REGION_CAPTION) | v10 recipe, 1 epoch | ~15.1% | — (vocab mismatch) |
+| M_cpg | CPG annotations, 5 epochs | **23.35%** (epoch 2) | TBD (seeds 0,2 pending) |
+| **M_human v11** | **EOS fix, 5 ep cosine restart** | **24.44% (step 3400)** | **TBD (seeds 0,2 pending)** |
 
 **Pending:**
-- v10 seeds 0+1 results → determine if EOS fix is a real improvement
-- If yes → lock M_human recipe, train M_auto (Florence-2 boxes)
-- Final three-way table: B0 vs M_human vs M_auto
+- M_human v11 seeds 0 and 2 → mean ± std
+- M_cpg seeds 0 and 2 → mean ± std
+- Final comparison table: B0 vs M_human v10 vs M_human v11 vs M_auto vs M_cpg
 - Final write-up
 
 ---

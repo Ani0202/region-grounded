@@ -6,7 +6,13 @@
       "Bash(.venv/bin/pip install *)",
       "WebSearch",
       "Bash(python3 *)",
-      "Bash(git check-ignore *)"
+      "Bash(git check-ignore *)",
+      "Bash(awk '{print $2, $3, $11}')",
+      "Bash(python *)",
+      "WebFetch(domain:media.nips.cc)",
+      "Bash(mkdir -p /Users/siddharthraj/Documents/my-projects/region-grounded/report)",
+      "Bash(curl -L https://media.neurips.cc/Conferences/NeurIPS2024/Styles.zip -o /Users/siddharthraj/Documents/my-projects/region-grounded/report/Styles.zip)",
+      "Bash(unzip -o Styles.zip)"
     ]
   }
 }

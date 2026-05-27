@@ -52,21 +52,21 @@ Training notebooks (`graft-training.ipynb`) are designed for **Google Colab with
 | Notebook | Purpose | Where to run |
 |---|---|---|
 | `05a_florence2_auto_bbox.ipynb` | Pilots Florence-2 `<DENSE_REGION_CAPTION>` on 5 Flickr30k images. Downloads Florence-2 base locally to `notebooks/florence2_local/` (≈885 MB), patches a flash-attn import, and visualises (bbox, label) outputs. | Local |
+| `07_florence2_annotate.ipynb` | Runs Florence-2 over all ~29k Flickr30k train images and saves `auto_annotations.json` to Google Drive. Resume-safe — re-running skips already-annotated images. Run this **once** before training M_auto. | **Colab L4 GPU** |
 
-**Note:** `notebooks/florence2_local/` is git-ignored because it contains large model weights. The notebook re-downloads it automatically on first run.
+**Note:** `notebooks/florence2_local/` is git-ignored because it contains large model weights. Both notebooks re-download it automatically on first run.
 
 ### Training
 
 | Notebook | Purpose | Where to run |
 |---|---|---|
-| `graft-training.ipynb` | Main training notebook. Runs SigLIP-B/16-384 + LoRA (r=4, α=16, targets `q_proj`/`v_proj`) on Flickr30k Entities. Change the config dict in cell 2 to switch between experiments (B1 global-only, M_human with region loss, M_auto with Florence-2 annotations). Logs to W&B. | **Colab L4 GPU** |
+| `graft-training.ipynb` | M_human training. Trains SigLIP + LoRA on Flickr30k Entities human annotations. Locked v10 recipe (EOS, q+v LoRA, λ=0.5, best-PG snapshot), seeds 0/1/2. | **Colab L4 GPU** |
+| `08_train_mauto.ipynb` | M_auto training. Loads `auto_annotations.json` from Drive and trains with the same locked v10 recipe. Run after `07_florence2_annotate.ipynb`. | **Colab L4 GPU** |
 
-**Running `graft-training.ipynb` on Colab:**
-1. Upload the notebook (or clone the repo with a PAT — see `notebooks/00_setup.ipynb`).
-2. Set runtime to **L4 GPU** (Runtime → Change runtime type).
-3. Cell 0 installs dependencies; run it first.
-4. Set `HF_TOKEN` and `WANDB_API_KEY` when prompted in cell 1.
-5. Edit the `CFG` dict in cell 2, then **Run All**.
+**Run order for full pipeline:**
+1. `07_florence2_annotate.ipynb` — generate Florence-2 annotations (~45–60 min)
+2. `graft-training.ipynb` — train M_human (seeds 0,1,2 — ~2 hours)
+3. `08_train_mauto.ipynb` — train M_auto (seeds 0,1,2 — ~2 hours)
 
 ---
 

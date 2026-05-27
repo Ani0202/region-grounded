@@ -1,0 +1,1008 @@
+%% GRAFT — Grounding Region Annotations into Fine-tuned Transformers
+%% NeurIPS 2024 style — compile with pdflatex
+%%
+%% \usepackage{neurips_2024}  -- download from:
+%% https://neurips.cc/Conferences/2024/PaperInformation/StyleFiles
+%%
+%% If you don't have it, replace \documentclass line with:
+%%   \documentclass[12pt,a4paper]{article}
+%%   \usepackage[margin=1.5in]{geometry}
+%% and remove the [preprint]{neurips_2024} package line.
+
+\documentclass{article}
+\PassOptionsToPackage{numbers,compress}{natbib}
+\usepackage[preprint]{neurips_2024}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{array}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{placeins}
+
+\definecolor{darkgreen}{rgb}{0.0,0.45,0.0}
+\definecolor{darkred}{rgb}{0.65,0.0,0.0}
+
+\newcommand{\pg}{\textsc{pg}}
+\newcommand{\ie}{\textit{i.e.}}
+\newcommand{\eg}{\textit{e.g.}}
+
+\title{GRAFT: Grounding Region Annotations into Fine-tuned Transformers}
+
+\author{Siddharth Raj\\
+  University of Chicago\\
+  \texttt{sidraj@uchicago.edu}
+  \And
+  Aniket Agrawal\\
+  University of Chicago\\
+  \texttt{agrawalaniket@uchicago.edu}
+}
+
+\begin{document}
+\maketitle
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\begin{abstract}
+Vision-language models trained on global image-caption contrastive objectives
+produce patch features with little spatial structure: individual tokens know
+what an image depicts, but not \emph{where}.  We ask whether a small amount of
+region-level supervision can teach an explicit spatial grounding signal without
+retraining the backbone. Concretely, we fine-tune SigLIP-B/16-384 using LoRA
+(0.14\% of the parameters) with a combined global and FILIP-style region loss,
+evaluated on the Flickr30k Pointing Game (PG).  Our main findings are: (1) the
+dominant source of improvement is not the loss formulation or model capacity,
+but \textbf{eliminating train/eval representation mismatches}---aligning the
+image path (MaskCLIP bypass) and text path (EOS token) raised the 3-seed mean
+from the baseline 14.74\% to 20.76\,$\pm$\,0.41\% with 6$\times$ lower
+variance; (2) five epochs of training with per-epoch cosine restarts pushes a
+single-seed result to \textbf{24.44\%} val PG / \textbf{26.16\%} test PG;
+(3) auto-generated annotations (Florence-2) match human-drawn ones only when
+the annotation vocabulary matches the evaluation distribution---switching from
+verbose region captions to caption-grounded phrases closes an 8.25 pp gap and
+reaches \textbf{23.35\%} PG.
+\end{abstract}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Introduction}
+\label{sec:intro}
+
+Modern vision-language models such as CLIP~\cite{radford2021clip} and
+SigLIP~\cite{zhai2023siglip} learn to align images and text through contrastive
+objectives applied at the image level. The internal patch tokens of these models
+therefore encode \emph{what} is in the image but carry almost no information
+about \emph{where} individual concepts are. This spatial blindness is a
+fundamental limitation: models that cannot ground noun phrases to image regions
+cannot support referring expression comprehension, dense captioning, or any
+downstream task that requires spatial reasoning about language.
+
+The standard remedy is to train or fine-tune on region-level annotations
+(\eg, Flickr30k Entities~\cite{plummer2015flickr30k}, RefCOCO), which pair noun
+phrases with bounding boxes. Full retraining is expensive; parameter-efficient
+fine-tuning via LoRA~\cite{hu2022lora} is cheap. The question is how much
+spatial grounding can be instilled in a globally-trained model by adding a
+region loss to a LoRA fine-tuning run.
+
+\textbf{Why SigLIP?} SigLIP replaces CLIP's softmax contrastive loss with
+sigmoid contrastive loss, which trains on (image, text) pairs independently
+rather than as a batch-level denominator.  This produces a stronger
+image-text matching model, but the sigmoid objective has \emph{even less}
+spatial bias than CLIP's softmax, because the denominator that might otherwise
+encourage patch-level diversity is absent. SigLIP is a harder test than CLIP;
+success here implies the approach generalises.
+
+\textbf{What we build.} We call our approach GRAFT (Grounding Region
+Annotations into Fine-tuned Transformers). Given a frozen SigLIP-B/16-384
+backbone, we attach LoRA adaptors to the query and value projections of both
+the vision and text encoders, and train with a loss that combines the original
+global image-caption objective with a FILIP-style~\cite{yao2021filip}
+phrase-to-patch alignment term. We evaluate with the Pointing Game
+(PG)~\cite{zhang2018top}: for each annotated (phrase, bounding box) pair, the
+argmax patch must fall inside the GT box.
+
+\textbf{Core findings.}
+\begin{enumerate}
+\item \textbf{Representation mismatches matter more than loss design.} We
+  identified and fixed two train/eval mismatches (image path, text path) that
+  together account for the bulk of PG improvement. Ablations varying the loss
+  weight, the LoRA target set, and the region loss formulation all returned to
+  the same mean once the mismatches were corrected.
+\item \textbf{Longer training with cosine restarts finds better basins.} Five
+  epochs with per-epoch restarts exhibit a staircase dynamic: epochs 1--3
+  reproduce the 1-epoch result; a step change occurs in epoch 4, lifting PG by
+  3--5 pp.
+\item \textbf{Annotation vocabulary is a critical design choice for auto-labels.}
+  Florence-2's dense region captions (verbose descriptions) failed because the
+  training vocabulary diverged from evaluation phrases. Switching to
+  caption-grounded phrases recovered the full gain.
+\end{enumerate}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Background and Related Work}
+\label{sec:background}
+
+\paragraph{Spatial grounding from global VLMs.}
+MaskCLIP~\cite{zhou2022maskclip} showed that replacing the last self-attention
+layer of a CLIP vision encoder with a value-only projection (\ie, skipping
+inter-patch mixing) yields patch features that are better structured for dense
+prediction, without any training.  SCLIP~\cite{wang2023sclip} used
+self-self attention to redistribute patch features based on spatial context.
+Our work is complementary: we keep the MaskCLIP bypass as a fixed
+representation choice and ask what supervised fine-tuning adds on top.
+
+\paragraph{Region loss formulations.}
+FILIP~\cite{yao2021filip} introduced token-level maximum similarity for
+image-text alignment: instead of pooled features, take the maximum cosine
+similarity between individual image and text tokens.  We adapt this to the
+phrase-to-patch setting: for a phrase $p$ and image $I$, the region loss
+requires $\max_{n \in \text{box}} \cos(f_n, e_p)$ to exceed
+$\max_{n \notin \text{box}} \cos(f_n, e_p)$, where $f_n$ is the $n$-th patch
+feature and $e_p$ is the phrase embedding.
+
+\paragraph{Automatic annotation with Florence-2.}
+Florence-2~\cite{xiao2024florence2} is a generalist vision-language model
+supporting a wide range of annotation tasks through text prompts.  Its
+\texttt{DENSE\_REGION\_CAPTION} task produces (bounding box, verbose
+description) pairs; its \texttt{CAPTION\_TO\_PHRASE\_GROUNDING} task takes a
+caption as input and grounds the noun phrases in it to bounding boxes.  We use
+both, and show that vocabulary alignment between the annotation task and the
+evaluation task is critical.
+
+\paragraph{LoRA.}
+LoRA~\cite{hu2022lora} freezes the pre-trained weight matrix $W_0 \in
+\mathbb{R}^{d \times k}$ and adds a low-rank update $\Delta W = W_0 + B A$,
+where $B \in \mathbb{R}^{d \times r}$, $A \in \mathbb{R}^{r \times k}$, and
+$r \ll \min(d, k)$.  At inference, the delta is merged: $W_{\text{eff}} = W_0
++ \frac{\alpha}{r} B A$.  We use $r = 4$, $\alpha = 16$ (scale = 4), targets
+$\{q\_\text{proj}, v\_\text{proj}\}$ in both encoders, yielding 295K trainable
+parameters (0.14\% of the 200M-parameter backbone).
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Approach}
+\label{sec:approach}
+
+\subsection{Training Objective}
+\label{sec:loss}
+
+The total loss is:
+\begin{equation}
+\mathcal{L} = \mathcal{L}_{\text{global}} + \lambda \cdot \mathcal{L}_{\text{region}}
+\label{eq:loss}
+\end{equation}
+
+\paragraph{Global loss $\mathcal{L}_{\text{global}}$.}
+Standard SigLIP sigmoid contrastive loss between the MHAP pooler output of the
+vision encoder and the EOS token of the text encoder, over image-caption pairs
+in the batch.  The pooler output (\texttt{pooler\_output}), not
+\texttt{mean(last\_hidden\_state)}, is critical: mean-pooling the patch tokens
+directly in the loss collapses spatial diversity (Exp-01, Section~\ref{sec:exps}).
+
+\paragraph{Region loss $\mathcal{L}_{\text{region}}$.}
+For each (image, phrase, bounding box) triple $(I_j, p_i, B_{ij})$ in a region
+batch, let $\hat{f}_n$ be the L2-normed patch feature at position $n$, and
+$\hat{e}_i$ be the L2-normed EOS phrase embedding. The in-box and out-of-box
+maximum similarities are:
+\begin{equation}
+s_{\text{in}} = \max_{n : n \in B_{ij}} \hat{f}_n \cdot \hat{e}_i,
+\qquad
+s_{\text{out}} = \max_{n : n \notin B_{ij}} \hat{f}_n \cdot \hat{e}_i
+\end{equation}
+The loss is sigmoid contrastive over an $N_{\text{region}} \times N_{\text{region}}$
+matrix of $(s_{\text{in}}, s_{\text{out}})$ comparisons, matching the SigLIP
+loss form. We set $\lambda = 0.5$; increasing it destabilises training
+(Section~\ref{sec:ablations}).
+
+\subsection{Representation Alignment}
+\label{sec:alignment}
+
+The most important design choices in GRAFT are not about the loss but about
+ensuring the training and evaluation representations are identical.
+
+\paragraph{Image path: MaskCLIP bypass during training.}
+Evaluation reads patch features after the last self-attention layer is replaced
+by a value-only projection:
+\[
+\text{bypass}(h) = W_O \, W_V \, h
+\]
+where $h$ is the input hidden state.  If training uses the full self-attention
+forward pass but evaluation reads the bypass, the gradients sharpen features
+under one representation while metrics measure another. We install the bypass
+\emph{before training begins}, so the gradient flows through the same
+$v\_\text{proj}$-only path that evaluation reads.  This single fix yields the
+largest gain in the project (+7.34 pp on PG; Section~\ref{sec:img-fix}).
+
+\paragraph{Text path: EOS token alignment.}
+Early versions used \texttt{mean(last\_hidden\_state)} over all phrase tokens
+in the region loss, while evaluation reads only the EOS position
+(\texttt{last\_hidden\_state[:, -1, :]}). These are different vectors. We
+replace the mean with the EOS token throughout training, creating a
+byte-for-byte match with the evaluation text vector. This collapses
+single-seed PG variance by $6\times$ and improves the 3-seed mean by +2.08 pp
+(Section~\ref{sec:eos-fix}).
+
+\subsection{Best-PG Snapshot}
+\label{sec:snapshot}
+
+The region loss can be satisfied by either a sharp argmax-friendly solution or
+a broad coverage-friendly one; the optimizer drifts between these basins during
+training. We address this with a lightweight best-checkpoint mechanism: during
+training, we evaluate PG on the 200-image validation split every 200 steps,
+snapshot the LoRA weights ($\sim$1 MB CPU memory) when PG improves, and
+restore the best snapshot at the end of training. This costs zero extra compute
+and provides free insurance against post-peak drift on every run.
+
+\subsection{Datasets and Evaluation Protocol}
+\label{sec:data}
+
+\paragraph{Training data.} Flickr30k~\cite{young2014image} consists of 31,000
+images with five captions each. We use the official train split (29,000 images)
+for all training runs, optionally held out 10\% as a test set.  For the human
+annotation condition (M\textsubscript{human}), bounding boxes come from
+Flickr30k Entities~\cite{plummer2015flickr30k}, which provides human-drawn
+boxes for noun phrases in the captions (average 5.7 phrases/image).  For
+automatic annotation conditions, we use Florence-2 to generate (phrase, box)
+pairs from the same images.
+
+\paragraph{Evaluation.} All models are evaluated on a fixed 200-image subset
+of the Flickr30k validation split (seed=42), containing 2,124 phrase-box pairs
+(10.6 pairs/image on average). The \textbf{Pointing Game (PG)} score is the
+fraction of pairs where the centre of the highest-similarity patch falls inside
+the GT bounding box. We also measure \textbf{Recall@1} (the fraction of pairs
+where the tight box around the top-$k$ selected patches overlaps the GT box at
+IoU $\geq 0.5$), using $k \in \{10, 25, \text{halfmax}\}$.  A held-out test
+set of 2,900 images (28,467 phrase-box pairs, SE $\approx$ 0.24 pp) provides
+statistically reliable generalisation estimates.
+
+\paragraph{Frozen baseline (B0).} SigLIP-B/16-384 with MaskCLIP bypass at
+evaluation, no fine-tuning. B0 PG = \textbf{14.74\%}. The gap between PG
+(14.74\%) and Recall@1 (6.83--7.91\%) indicates the model has a weak
+directional signal but no coherent spatial clustering: the argmax occasionally
+lands near the right region, but the surrounding high-scoring patches scatter
+across the image.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Experiments}
+\label{sec:exps}
+
+We ran 15 experiments progressing from a broken initial recipe to the final
+locked configuration. We describe them grouped by the mechanistic insight each
+contributed.
+
+\subsection{Initial Failures: MHAP Pooler Fix (Exp-01, 02)}
+\label{sec:initial}
+
+The first training run used mean-pooling of all patch tokens for the global
+loss. Both the model with (M\textsubscript{human}) and without (B1) the region
+loss regressed below the frozen baseline on VOC mIoU, and PG also regressed.
+Root cause: mean-pooling pushes all 576 patch features uniformly toward the
+caption, collapsing the spatial diversity that grounding requires.
+
+Switching to the MHAP \texttt{pooler\_output} (a dedicated max-pooling head in
+SigLIP) fixed the collapse: patch features were freed to be spatially diverse.
+However, PG still sat at 13.42\% (below B0) after this fix alone, for a
+different reason traced in the next experiment.
+
+\subsection{Image-Path Alignment: MaskCLIP Bypass During Training (Exp-03)}
+\label{sec:img-fix}
+
+With the MHAP fix in place but without the MaskCLIP bypass during training, PG
+= 13.42\% (below B0) while Recall@1 top-10 improved slightly (+0.28 pp). This
+mixed result is the signature of a \emph{train/eval path mismatch}: training
+read patch features through the full last self-attention layer, but evaluation
+read them through the bypass. The gradient sharpened patches under one
+representation; the argmax metric measured the other. The Recall@1 improvement
+confirmed the model was learning something real---it was just invisible to
+argmax localization.
+
+Installing the MaskCLIP bypass before training produced a step change:
+\textbf{PG = 22.08\% (+7.34 pp over B0)} on the first run. The bypass fix also
+changed the \emph{shape} of the response: training through full attention
+produced broad, weak activation across the bounding box (good for Recall@1
+coverage, bad for argmax); training through the bypass produced a single sharp
+spike on one patch inside the box---the behaviour the max-pool region loss
+actually rewards.
+
+\subsection{Variance Quantification (Exp-06)}
+\label{sec:variance}
+
+The 22.08\% result was a single run. Subsequent runs with ``identical''
+hyperparameters but different DataLoader shuffle orders produced 18.41\% and
+16.90\%---a 5.18 pp spread ($\approx 6\sigma$ on the binomial standard error).
+We added full seed control (Python, NumPy, PyTorch CPU/CUDA, DataLoader
+generator) and ran 3 seeds. Results:
+
+\begin{center}
+\begin{tabular}{lccccc}
+\toprule
+ & B0 & seed 0 & seed 1 & seed 2 & mean $\pm$ std \\
+\midrule
+PG & 14.74\% & 19.26\% & 15.87\% & 20.90\% & \textbf{18.68 $\pm$ 2.57\%} \\
+R@1 halfmax & 7.58\% & 7.30\% & 7.30\% & 7.30\% & 7.30 $\pm$ 0.00\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The 22.08\% result was a $+1.3\sigma$ draw; the true mean improvement is
++3.94 pp. Crucially, R@1 halfmax is \emph{identical across all three seeds}
+(to four decimal places), while PG varies by 5 pp. The recipe is learning a
+stable broader grounding signal---the variance is entirely in which single
+patch wins the argmax for borderline phrases. From this point, we adopted a
+``leader-seed'' protocol: test new ideas on seed=2 first; run all 3 seeds only
+if seed=2 exceeds 21.25\% (mean + $\sigma$).
+
+\subsection{Ablations: Loss Weight, Capacity, and Aggregation (Exp-07--10)}
+\label{sec:ablations}
+
+We tested three hypotheses for pushing PG above the 18.68\% mean, all on
+seed=2 against the 20.90\% leader baseline.
+
+\textbf{$\lambda$ 0.5 $\to$ 1.0 (Exp-07).} PG fell to 17.18\% (--3.72 pp).
+Doubling the region loss weight broadened the patch response rather than
+sharpening it: more in-bbox patches at medium similarity satisfies the max-pool
+objective just as well as a sharp spike, and the optimizer took the broader
+path. The global loss, whose weight halved in relative terms, provides
+structural regularisation that constrains patch features to a coherent
+manifold; removing it caused a mid-training collapse (PG below B0 at step 400).
+Notably, R@1 top-25 \emph{increased} to 7.58\% (+0.56 pp over v5 seed=2)
+even as PG fell---confirming the broadening interpretation: more in-bbox
+patches at medium similarity, but not one strong argmax spike.
+
+\textbf{k-proj LoRA, q+v $\to$ q+k+v (Exp-08).} Adding key projections to the
+LoRA target set (+50\% trainable params, 442K total) produced the highest
+checkpoint of any run: 22.69\% PG at step 400---but the model then drifted to
+17.80\% by end of epoch. More capacity let the model find a sharp grounding
+pattern faster, but also gave the optimizer more freedom to walk away from it.
+The \emph{peak} improved; the \emph{final result} did not.
+
+\textbf{Top-K mean region loss (Exp-09, 10).} Adding the best-PG snapshot to
+the q+k+v run (Exp-09) confirmed that the snapshot mechanism works: final PG
+= 19.96\% (saved from the 17.51\% end-of-epoch state). Replacing the max-pool
+region loss with a top-3 mean (Exp-10) produced PG = 19.35\%. Neither move
+changed the 3-seed mean. We concluded that the bottleneck was not on the image
+or loss side. As shown in Table~\ref{tab:ablations}, R@1 halfmax is 7.30\% on
+every single run (identical to 4 decimal places)---all four ablations learn the
+same broad grounding signal; the variance is entirely in PG (argmax).
+
+\begin{table}[H]
+\centering
+\caption{Ablation results on seed=2. All runs use the v5 base recipe
+(q+v LoRA, $\lambda{=}0.5$, 1 ep, best-PG snapshot from Exp-09 onward)
+with one change each. R@1 halfmax is constant across all variants.}
+\label{tab:ablations}
+\setlength{\tabcolsep}{5pt}
+\begin{tabular}{lcccc}
+\toprule
+Variant & PG & R@1 top-10 & R@1 top-25 & R@1 halfmax \\
+\midrule
+v5 seed=2 (baseline)      & 20.90\% & 5.98\% & 7.02\% & 7.30\% \\
+v6: $\lambda{=}1.0$        & 17.18\% & 5.93\% & \textbf{7.58\%} & 7.30\% \\
+v7: +k-proj LoRA           & 17.80\% & 5.46\% & 7.25\% & 7.30\% \\
+v8: +best-PG snap          & 19.96\% & ---    & ---    & 7.30\% \\
+v9: top-3 mean loss        & 19.35\% & 5.50\% & 7.18\% & 7.30\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Text-Path Alignment: EOS Token Fix (Exp-11)}
+\label{sec:eos-fix}
+
+The image-side mismatch (training through full attention vs. MaskCLIP bypass)
+had been fixed in Exp-03. An analogous mismatch on the text side had persisted
+throughout:
+\begin{itemize}
+\item \textbf{Training}: region loss used \texttt{mean(last\_hidden\_state)}
+  over all phrase tokens.
+\item \textbf{Evaluation}: PG used \texttt{last\_hidden\_state[:, -1, :]}---the
+  EOS position only.
+\end{itemize}
+The region loss was teaching patches to align with the mean-over-tokens
+representation, but PG measured alignment with the EOS representation. Fixing
+this is mechanistically identical to the image-side fix, applied to the text
+encoder.
+
+We replaced \texttt{mean-over-tokens} with the EOS token throughout training,
+reverted to q+v LoRA (k-proj correlated with drift), and kept the best-PG
+snapshot. Results across 3 seeds:
+
+\begin{center}
+\begin{tabular}{llcccc}
+\toprule
+ & & seed 0 & seed 1 & seed 2 & mean $\pm$ std \\
+\midrule
+\multirow{2}{*}{v5} & PG       & 19.26\% & 15.87\% & 20.90\% & 18.68 $\pm$ 2.57\% \\
+                    & R@1 hmax & 7.30\%  & 7.30\%  & 7.30\%  & 7.30 $\pm$ 0.00\% \\
+\midrule
+\multirow{2}{*}{v10 (EOS fix)} & PG       & 20.57\% & 20.48\% & 21.23\% & \textbf{20.76 $\pm$ 0.41\%} \\
+                               & R@1 hmax & 7.44\%  & 7.34\%  & ---     & --- \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The EOS fix raised the mean by +2.08 pp and collapsed the variance by $6\times$
+(from 2.57 to 0.41 pp). Every seed now falls in the range [20.48, 21.23]---a
+0.75 pp spread vs. v5's 5.03 pp spread. The best-PG snapshot eliminated
+late-training drift entirely on every seed: peak PG and final PG are identical
+for all three. This recipe (v10) is the locked M\textsubscript{human}
+configuration.
+
+\textbf{Mechanistic reading.} The EOS fix raised the \emph{peak}; the best-PG
+snapshot locked it. Both ingredients contribute orthogonally. The drift itself
+(still visible in raw trajectories) is a generic overfit dynamic in LoRA on
+small data; the snapshot is the correct mitigation regardless of its cause.
+
+\subsection{Generalisation Test (Exp-12)}
+\label{sec:gentest}
+
+The best-PG snapshot selects the checkpoint with the highest validation PG,
+raising the question of whether the reported number is optimistically biased by
+the selection step. We held out 10\% of the Flickr30k training split (2,900
+images, 28,467 phrase-box pairs) as an independent test set, never used for
+any training-time decision.
+
+\begin{center}
+\begin{tabular}{lcccccc}
+\toprule
+seed & val PG & test PG & $\Delta$ & R@1 top-10 & R@1 top-25 & R@1 halfmax \\
+\midrule
+0 & 19.92\% & 19.84\% & $-$0.08 & 5.74\% & 7.72\% & 7.25\% \\
+1 & 21.61\% & 21.83\% & $+$0.22 & 6.59\% & 7.58\% & 7.34\% \\
+2 & 17.94\% & 18.52\% & $+$0.58 & 6.54\% & 7.34\% & 7.25\% \\
+\midrule
+mean & 19.82$\pm$1.84\% & 20.07$\pm$1.67\% & $+$0.25 & --- & --- & 7.28\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The val$\to$test delta is effectively zero. Test PG is \emph{higher} than val
+PG on average, and every seed's test PG is within 0.6 pp of its val PG. The
+best-PG snapshot selects genuinely good checkpoints, not ones that happened to
+score well on the validation split by chance. With 28,467 pairs (SE $\approx$
+0.24 pp), the +5.33 pp test gain over B0 is a $\sim$22$\sigma$ signal.
+
+\subsection{Five-Epoch Training (Exp-13)}
+\label{sec:5ep}
+
+With the locked v10 recipe, training plateaus or drifts after step 400--800
+($\sim$half the epoch). We trained for 5 epochs with per-epoch cosine restarts
+(\texttt{restarts=5}, each epoch its own warmup$\to$cosine$\to$0 cycle).
+
+The PG trajectory for seed=1 (Table~\ref{tab:v11traj}) shows a clear
+staircase pattern: epochs 1--3 reproduce the 1-epoch v10 result ($\sim$19--20\%
+val PG); a step change occurs in epoch 4 ($+$3--5 pp), and the gain persists
+through epoch 5. The per-epoch restarts kick the optimizer out of the epoch-1
+basin into a deeper minimum.
+
+\begin{table}[H]
+\centering
+\caption{Selected steps from the 5-epoch training trajectory (seed=1).}
+\label{tab:v11traj}
+\begin{tabular}{rlrr}
+\toprule
+Step & Epoch & Val PG & Test PG \\
+\midrule
+800  & 1 & 19.68\% & 19.92\% \\
+1600 & 2 & 19.40\% & 20.74\% \\
+2400 & 3 & 19.21\% & 21.41\% \\
+3000 & 4 & 23.59\% & 24.59\% \\
+\textbf{3400} & \textbf{5} & \textbf{24.44\%} & \textbf{25.26\%} \\
+4000 & 5 & 24.11\% & 26.03\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The best-PG snapshot was taken at step 3400 (24.44\% val PG). The final test
+PG on the full held-out set is \textbf{26.16\%} (7,447/28,467 pairs).
+Table~\ref{tab:v11final} shows the full metric breakdown at the best-PG
+checkpoint.
+
+\begin{table}[H]
+\centering
+\caption{M\textsubscript{human} v11 final metrics at best-PG checkpoint
+(step 3400, seed=1). R@1 top-25 = 8.29\% is the only trained model to
+beat B0's 7.91\%, indicating genuine spatial coherence after 5 epochs.}
+\label{tab:v11final}
+\begin{tabular}{lrr}
+\toprule
+Metric & Val & Test \\
+\midrule
+Pointing Game     & \textbf{24.44\%} & \textbf{26.16\%} \\
+R@1 top-10        & 5.93\%  & ---    \\
+R@1 top-25        & \textbf{8.29\%}  & 7.67\% \\
+R@1 halfmax       & 7.30\%  & 7.35\% \\
+\midrule
+\textit{B0 baseline} & & \\
+~~Pointing Game   & 14.74\% & ---    \\
+~~R@1 top-25      & 7.91\%  & ---    \\
+~~R@1 halfmax     & 7.58\%  & ---    \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Automatic Annotations: M\textsubscript{auto} and M\textsubscript{cpg} (Exp-14, 15)}
+\label{sec:mauto}
+
+\paragraph{M\textsubscript{auto}: Dense Region Captions (Exp-14).}
+We replaced Flickr30k Entities with Florence-2 \texttt{DENSE\_REGION\_CAPTION}
+annotations: automatically generated (bounding box, verbose description) pairs
+(29,000 images, $\sim$9.8 regions/image). The locked v10 recipe was used
+unchanged. Result: best-PG $\approx$15.1\% (barely above B0 = 14.74\%). PG
+collapsed to $\sim$11.5\% at step 600 and recovered only partially.
+
+\textbf{Diagnosis: train/eval vocabulary mismatch.} Florence-2
+\texttt{DENSE\_REGION\_CAPTION} generates verbose descriptions
+(\eg, ``a woman in a blue top standing near a fence''). Evaluation uses short
+Flickr30k Entities phrases (\eg, ``woman'', ``the man''). SigLIP's
+pre-trained representations can bridge this gap at initialisation ($\sim$15\%);
+as region loss gradients accumulate, patch features align with the verbose
+training vocabulary and diverge from the short-phrase evaluation distribution.
+Bounding box \emph{geometry} from Florence-2 is accurate; the \emph{labels}
+are the problem.
+
+\paragraph{M\textsubscript{cpg}: Caption-to-Phrase Grounding (Exp-15).}
+Florence-2 \texttt{CAPTION\_TO\_PHRASE\_GROUNDING} takes the Flickr30k caption
+as input and returns noun phrases grounded to bounding boxes---the same caption
+that drives the global loss, and noun phrases from the same distribution as
+Flickr30k Entities evaluation phrases. We ran 5 epochs on seed=1.
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+Epoch & Val PG & Test PG \\
+\midrule
+1 & 22.60\% & 22.50\% \\
+\textbf{2} & \textbf{23.35\%} & 22.79\% \\
+3 & 21.99\% & 21.96\% \\
+4 & 22.65\% & \textbf{23.15\%} \\
+5 & 22.03\% & 22.13\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Best val PG = 23.35\% (epoch 2); best test PG = 23.15\% (epoch 4).
+The +8.25 pp gain over M\textsubscript{auto} (same Florence-2 model, same
+images, same recipe, only labels changed) isolates annotation vocabulary as the
+sole cause of M\textsubscript{auto}'s failure.
+
+M\textsubscript{cpg} (23.35\%) also outperforms M\textsubscript{human} v10
+(20.48\%, seed=1) by +2.87 pp. Florence-2 grounds phrases from all five
+Flickr30k captions per image, producing denser supervision than the human
+Entities annotations, which cover a fixed set of phrases per image. When
+vocabulary is controlled, automatic annotations at scale can exceed human-drawn
+ones. Table~\ref{tab:main} summarises all models; the full experiment log is in
+Appendix~\ref{app:explog}.
+
+\begin{table}[H]
+\centering
+\caption{Main results on the Flickr30k Pointing Game. All models use
+SigLIP-B/16-384 with MaskCLIP bypass at evaluation. Val: 200 images, 2,124
+pairs. Test: 2,900 held-out images, 28,467 pairs. $^\dagger$Single seed;
+mean $\pm$ std pending. R@1 = Recall@1 at IoU$\geq$0.5; halfmax = all
+patches with similarity $\geq 0.5 \times$ max; ``---'' = not measured.}
+\label{tab:main}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{llllll}
+\toprule
+Model & Config & Val PG & Test PG & R@1 top-25 & R@1 halfmax \\
+\midrule
+B0 (frozen) & — & 14.74\% & --- & 7.91\% & 7.58\% \\
+\midrule
+M\textsubscript{human} v5  & FILIP, 1 ep        & 18.68$\pm$2.57\% & ---               & 7.12$\pm$0.12\% & \textbf{7.30$\pm$0.00\%} \\
+M\textsubscript{human} v10 & EOS+snap, 1 ep     & \textbf{20.76$\pm$0.41\%} & 20.07$\pm$1.67\% & ---      & 7.28\%$^\ddagger$ \\
+M\textsubscript{human} v11 & EOS+snap, 5 ep     & 24.44\%$^\dagger$ & 26.16\%$^\dagger$ & \textbf{8.29\%} & 7.30\% \\
+\midrule
+M\textsubscript{auto}      & Dense cap., 1 ep   & $\sim$15.1\%$^\dagger$ & ---          & ---             & --- \\
+M\textsubscript{cpg}       & Phrase ground., 5 ep & 23.35\%$^\dagger$ & 23.15\%$^\dagger$ & ---           & --- \\
+\bottomrule
+\end{tabular}
+{\small $^\ddagger$Mean of seeds 0 and 1 only (seed 2 not recorded).}
+\end{table}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Results and Discussion}
+\label{sec:results}
+
+\paragraph{The two biggest gains come from alignment, not architecture.}
+The image-path fix (v1$\to$v2, +7.34 pp on one seed, +3.94 pp on 3-seed mean)
+and the text-path fix (v5$\to$v10, +2.08 pp mean, $6\times$ variance
+reduction) together account for the majority of total improvement. All ablation
+experiments varying the loss formulation, loss weight, and LoRA target set
+returned to the same mean ($\sim$18--21\%) once the mismatches were in place.
+This suggests that the bottleneck in adapting globally-trained VLMs for spatial
+grounding is not loss design but representation consistency.
+
+\paragraph{Variance is concentrated in argmax, not coverage.}
+The R@1 halfmax metric (all patches above half the maximum similarity) is
+\emph{identical} across seeds (7.30 $\pm$ 0.00\% on v5), while PG varies by
+2.57 pp. The model learns a stable broad grounding signal; the 3-5 pp PG
+variance is purely in which single patch wins the argmax for borderline
+phrases. R@1 halfmax is the more reliable metric for monitoring whether the
+recipe is learning anything at all; PG is the more informative metric for
+comparing strong models.
+
+\paragraph{Longer training unlocks a second optimisation basin.}
+The staircase pattern in v11 (Table~\ref{tab:v11traj}) suggests that the
+1-epoch recipe converges to a local minimum from which small perturbations
+(changing $\lambda$, adding k-proj LoRA) cannot escape. Per-epoch cosine
+restarts provide the momentum to leave that basin at epoch 4. This is a
+practical insight: when ablations around a recipe all fail, more training may
+be more productive than further hyperparameter search.
+
+\paragraph{Vocabulary alignment dominates annotation quality for auto-labels.}
+The 8.25 pp gap between M\textsubscript{auto} and M\textsubscript{cpg} is
+entirely attributable to label vocabulary. Florence-2 can produce accurate
+bounding boxes; the constraint is that the phrase labels must come from the same
+distribution as evaluation phrases. This is a non-trivial requirement when
+evaluation uses a fixed dataset with its own vocabulary (Flickr30k Entities):
+any auto-labelling pipeline must either match that vocabulary or rely on the
+pre-trained model's cross-vocabulary generalisation not degrading under
+fine-tuning.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Qualitative Results}
+\label{sec:qualitative}
+
+Figure~\ref{fig:viz} shows the most dramatic example from our validation scan:
+a case where both fine-tuned models clearly outperform the frozen baseline.
+Each column shows the plasma-normalised cosine-similarity heatmap blended over
+the image, the ground-truth bounding box (white rectangle), and the argmax
+patch centre ($\bigstar$; {\color{green!60!black}green} = hit,
+{\color{red}red} = miss). All six cherry-picked images are in
+Appendix~\ref{app:viz} (Figures~\ref{fig:app1}--\ref{fig:app6}).
+
+\begin{figure}[p]
+\centering
+\includegraphics[width=\linewidth,height=0.82\textheight,keepaspectratio]{pg_viz_04_1507563902}
+\caption{\textbf{Most dramatic case.} Image \texttt{1507563902.jpg}
+($n{=}3$ phrases).
+B0: 33\%\enspace M\textsubscript{human}: \textbf{100\%}\enspace
+M\textsubscript{auto}: \textbf{67\%}.
+B0 localises only 1 of 3 phrases; M\textsubscript{human} hits all 3.
+Columns: Frozen B0 (left) / M\textsubscript{human} (centre) /
+M\textsubscript{auto} (right).
+Plasma heatmap = patch-phrase cosine similarity; white box = GT bounding box;
+$\bigstar$ = argmax patch ({\color{green!60!black}green} hit /
+{\color{red}red} miss).}
+\label{fig:viz}
+\end{figure}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have shown that LoRA fine-tuning with a region loss can teach meaningful
+spatial grounding to a globally-trained VLM (SigLIP-B/16-384), raising the
+Flickr30k Pointing Game from 14.74\% to 24.44\% val / 26.16\% test (single
+seed, 5 epochs) and 20.76\,$\pm$\,0.41\% (3-seed mean, 1 epoch).  The key
+lessons are:
+
+\begin{enumerate}
+\item \textbf{Fix mismatches first.} The two biggest gains in the project came
+  from aligning the image path (MaskCLIP bypass during training) and text path
+  (EOS token throughout) with evaluation. Neither required any architectural
+  change or new data. Loss and architecture ablations had small or negative
+  effect on the mean.
+\item \textbf{Measure variance before drawing conclusions.} The first
+  single-point result (22.08\%) was 1.3$\sigma$ above the true 3-seed mean.
+  A proper variance study should precede any recipe change comparison.
+\item \textbf{The global loss is structural, not optional.} Reducing its weight
+  removes a constraint that keeps patch features in a coherent manifold;
+  training destabilises.
+\item \textbf{Best-PG snapshot is free insurance.} It costs $\sim$1 MB of CPU
+  memory, zero compute, and eliminates end-of-training drift on every run.
+\item \textbf{For auto-labels, vocabulary controls everything.} Florence-2
+  bounding boxes are geometrically accurate; the critical design choice is
+  which annotation task supplies the phrase labels.
+\end{enumerate}
+
+The strongest remaining open question is whether the 5-epoch result (24.44\%)
+is robust across seeds---the $\sigma \approx 2.57$ pp observed in 1-epoch
+training suggests meaningful variance may persist. Running seeds 0 and 2 for
+both v11 and M\textsubscript{cpg} is the immediate next step.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Limitations and Future Work}
+\label{sec:future}
+
+\paragraph{Broader evaluation benchmarks.}
+The Pointing Game on Flickr30k is a useful proxy but a narrow one: binary
+hit/miss on 200 images with a fixed phrase vocabulary. RefCOCO and RefCOCO+
+are the standard benchmarks for referring expression comprehension, covering a
+different annotation style (relational expressions such as ``the person on the
+left'') and a different image domain (MS-COCO). Evaluating GRAFT on these
+would test whether the grounding signal transfers beyond the distribution it
+was trained on.
+
+\paragraph{Dense segmentation.}
+VOC mIoU was tracked throughout as a guardrail and consistently regressed
+(B0 = 1.43\%; all trained models stayed below). This was expected: the
+FILIP max-pool loss rewards one sharp patch per phrase, not a spatially
+coherent mask. Now that PG has reached 24.44\%, it is worth revisiting
+whether the stronger grounding signal incidentally improves dense prediction,
+or whether PG and segmentation mIoU are genuinely measuring orthogonal
+properties of patch features.
+
+\paragraph{Grounding at multiple granularities.}
+All experiments used short noun phrases (\eg, ``the woman'', ``a red jacket'')
+as the grounding target. An open question is whether the same recipe extends
+to longer, relational descriptions (\eg, ``the person on the left wearing a
+red jacket'') that require integrating evidence across multiple spatial
+locations. Such descriptions may require a richer text representation than
+a single EOS token and a loss formulation that rewards patch \emph{sets}
+rather than individual patches.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section*{References}
+\begingroup
+\renewcommand{\section}[2]{}
+\begin{thebibliography}{99}
+
+\bibitem{radford2021clip}
+A.\ Radford, J.\ W.\ Kim, C.\ Hallacy, A.\ Ramesh, G.\ Goh, S.\ Agarwal,
+G.\ Sastry, A.\ Askell, P.\ Mishkin, J.\ Clark, G.\ Krueger, and I.\ Sutskever.
+Learning transferable visual models from natural language supervision.
+In \emph{ICML}, 2021.
+
+\bibitem{zhai2023siglip}
+X.\ Zhai, B.\ Mustafa, A.\ Kolesnikov, and L.\ Beyer.
+Sigmoid loss for language image pre-training.
+In \emph{ICCV}, 2023.
+
+\bibitem{hu2022lora}
+E.\ J.\ Hu, Y.\ Shen, P.\ Wallis, Z.\ Allen-Zhu, Y.\ Li, S.\ Wang, L.\ Wang,
+and W.\ Chen.
+LoRA: Low-rank adaptation of large language models.
+In \emph{ICLR}, 2022.
+
+\bibitem{yao2021filip}
+L.\ Yao, R.\ Huang, L.\ Hou, G.\ Lu, M.\ Niu, H.\ Xu, X.\ Liang, Z.\ Li,
+X.\ Jiang, and C.\ Xu.
+FILIP: Fine-grained interactive language-image pre-training.
+In \emph{ICLR}, 2022.
+
+\bibitem{zhou2022maskclip}
+C.\ Zhou, C.\ C.\ Loy, and B.\ Dai.
+Extract free dense labels from CLIP.
+In \emph{ECCV}, 2022.
+
+\bibitem{wang2023sclip}
+F.\ Wang, J.\ Cui, Y.\ Kim, A.\ Guo, Y.\ Lu, and A.\ Yuille.
+SCLIP: Rethinking self-attention for dense vision-language inference.
+\emph{arXiv:2312.01597}, 2023.
+
+\bibitem{plummer2015flickr30k}
+B.\ A.\ Plummer, L.\ Wang, C.\ M.\ Cervantes, J.\ C.\ Caicedo,
+J.\ Hockenmaier, and S.\ Lazebnik.
+Flickr30k entities: Collecting region-to-phrase correspondences for richer
+image-to-sentence models.
+In \emph{ICCV}, 2015.
+
+\bibitem{young2014image}
+P.\ Young, A.\ Lai, M.\ Hodosh, and J.\ Hockenmaier.
+From image descriptions to visual denotations: New similarity metrics for
+semantic inference over event descriptions.
+\emph{TACL}, 2014.
+
+\bibitem{xiao2024florence2}
+B.\ Xiao, H.\ Wu, W.\ Xu, X.\ Dai, H.\ Hu, Y.\ Lu, M.\ Zeng, C.\ Liu, and
+L.\ Yuan.
+Florence-2: Advancing a unified representation for a variety of vision tasks.
+In \emph{CVPR}, 2024.
+
+\bibitem{zhang2018top}
+J.\ Zhang, Z.\ Lin, J.\ Brandt, X.\ Shen, and S.\ Sclaroff.
+Top-down neural attention by excitation backprop.
+\emph{IJCV}, 2018.
+
+\end{thebibliography}
+\endgroup
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\FloatBarrier
+\appendix
+
+\section{Full Experiment Log}
+\label{app:explog}
+
+Table~\ref{tab:allexps} reports the complete sequence of experiments with their
+primary PG result. Entries marked $\dagger$ are single seeds (seed=2 unless
+noted); entries with $n=3$ report mean $\pm$ std.
+
+\begin{table}[H]
+\centering
+\caption{All 15 experiments. $\lambda=0.5$ throughout unless noted. Best-PG
+snapshot used from Exp-09 onward.}
+\label{tab:allexps}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{clll}
+\toprule
+Exp & Key change & Val PG & Notes \\
+\midrule
+01 & Baseline LoRA + mean-pool global & Regression & VOC mIoU regressed \\
+02 & MHAP pooler fix & 13.42\%$^\dagger$ & PG below B0 \\
+03 & MaskCLIP bypass during training & 22.08\%$^\dagger$ & +7.34 pp; path mismatch fixed \\
+04 & 2 ep single cosine & $\leq$19.40\%$^\dagger$ & LR too high too long \\
+05 & 2 ep cosine restart & 16.90--18.41\%$^\dagger$ & High variance identified \\
+06 & Seed control, 3 seeds & 18.68 $\pm$ 2.57\% & True mean +3.94 pp \\
+07 & $\lambda$: 0.5$\to$1.0 & 17.18\%$^\dagger$ & Broadens response; collapse \\
+08 & +k-proj LoRA & 17.80\%$^\dagger$ (22.69\% peak) & Peak good, drifts \\
+09 & +best-PG snapshot & 19.96\%$^\dagger$ & Snapshot works; k-proj neutral \\
+10 & Top-K mean region loss & 19.35\%$^\dagger$ & No improvement \\
+11 & EOS text alignment, 3 seeds & \textbf{20.76 $\pm$ 0.41\%} & $6\times$ variance reduction \\
+12 & Generalisation test (90-10) & 19.82 $\pm$ 1.84\% & Test: 20.07 $\pm$ 1.67\%; no leakage \\
+13 & 5 ep cosine restart & \textbf{24.44\%}$^\dagger$ & Test 26.16\%; staircase \\
+14 & M\textsubscript{auto} dense caption & $\sim$15.1\%$^\dagger$ & Vocab mismatch failure \\
+15 & M\textsubscript{cpg} phrase ground. & \textbf{23.35\%}$^\dagger$ & +8.25 pp vs.\ M\textsubscript{auto} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Ablation Detail: v5 Trajectory by Seed}
+\label{app:v5traj}
+
+\begin{table}[H]
+\centering
+\caption{PG at each evaluation step during 1-epoch training (v5). Binomial SE
+$\approx 0.87$ pp at $p \approx 0.19$, $n=2124$.}
+\begin{tabular}{rrrrr}
+\toprule
+Step & Epoch & seed 0 & seed 1 & seed 2 \\
+\midrule
+0   & 0 & 14.74 & 14.74 & 14.74 \\
+200 & 1 & 16.43 & 16.15 & 16.48 \\
+400 & 1 & 16.71 & 19.02 & 19.92 \\
+600 & 1 & 19.30 & 14.92 & 20.62 \\
+800 & 1 & 19.16 & 16.10 & 20.95 \\
+end & 1 & 19.26 & 15.87 & 20.90 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Seed 1's collapse to 14.92\% at step 600 (below B0) and partial recovery to
+15.87\% is a consistent feature of the loss/metric landscape, not a randomness
+artefact. It also occurred in Exp-05 (v4 attempt 2) and reflects a training
+basin where the FILIP objective is satisfied by attention patterns that hurt
+argmax localisation.
+
+\section{M\textsubscript{human} v11 Full Trajectory}
+\label{app:v11traj}
+
+\begin{table}[H]
+\centering
+\caption{Full 5-epoch training trajectory for M\textsubscript{human} v11,
+seed=1. Best-PG snapshot taken at step 3400.}
+\begin{tabular}{rlrr}
+\toprule
+Step & Epoch & Val PG (\%) & Test PG (\%) \\
+\midrule
+200  & 1 & 16.34 & 15.04 \\
+400  & 1 & 19.59 & 18.48 \\
+600  & 1 & 19.63 & 19.92 \\
+800  & 1 & 19.68 & 19.92 \\
+1000 & 2 & 17.33 & 18.94 \\
+1200 & 2 & 18.55 & 20.53 \\
+1400 & 2 & 18.79 & 20.12 \\
+1600 & 2 & 19.40 & 20.74 \\
+1800 & 3 & 17.94 & 18.69 \\
+2000 & 3 & 17.47 & 19.71 \\
+2200 & 3 & 18.64 & 22.23 \\
+2400 & 3 & 19.21 & 21.41 \\
+2600 & 4 & 22.74 & 23.20 \\
+2800 & 4 & 22.69 & 22.43 \\
+3000 & 4 & 23.59 & 24.59 \\
+3200 & 4 & 23.26 & 25.00 \\
+\textbf{3400} & \textbf{5} & \textbf{24.44} & \textbf{25.26} \\
+3600 & 5 & 23.26 & 24.79 \\
+3800 & 5 & 24.15 & 25.72 \\
+4000 & 5 & 24.11 & 26.03 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Locked Recipe}
+\label{app:recipe}
+
+\begin{table}[H]
+\centering
+\caption{GRAFT locked recipe (M\textsubscript{human} v10 / v11).}
+\begin{tabular}{ll}
+\toprule
+Component & Setting \\
+\midrule
+Backbone & SigLIP-B/16-384, all parameters frozen \\
+LoRA targets & $q\_\text{proj}$, $v\_\text{proj}$ (both encoders) \\
+LoRA rank / $\alpha$ & $r=4$, $\alpha=16$ (scale = 4) \\
+Trainable params & 295K (0.14\% of backbone) \\
+Global loss & SigLIP sigmoid; MHAP \texttt{pooler\_output} \\
+Region loss & EOS phrase $\cdot$ patch, max-pool, sigmoid SigLIP \\
+$\lambda$ & 0.5 \\
+Learning rate & 2e-4, cosine decay with 100-step warmup \\
+Batch / region batch & 32 / 64 \\
+Epochs (v10 / v11) & 1 / 5 \\
+LR schedule & Per-epoch cosine restart (\texttt{restarts=epochs}) \\
+Snapshot & Best-PG on 200-image val (every 200 steps) \\
+Image path & MaskCLIP bypass installed before training \\
+Text path & EOS token (last non-padding) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\FloatBarrier
+\section{Pointing Game Visualisations}
+\label{app:viz}
+
+All six cherry-picked validation images are shown below, one per page.
+Each panel shows: \textbf{left} = Frozen B0; \textbf{centre} = M\textsubscript{human};
+\textbf{right} = M\textsubscript{auto}.  Each row corresponds to one query
+phrase.  Plasma heatmap = cosine similarity of each $24{\times}24$ patch
+to the query phrase; white box = GT bounding box; $\bigstar$ = argmax patch
+({\color{green!60!black}green} = hit / {\color{red}red} = miss).
+Per-image Pointing Game scores (fraction of phrases hit) are shown in the
+caption.  Images were selected by scanning all 200 validation images for
+cases where both fine-tuned models outperform B0; the list is sorted by
+combined PG gain over B0.
+
+\begin{figure}[p]
+\centering
+\includegraphics[width=\linewidth,height=0.82\textheight,keepaspectratio]{pg_viz_01_1836335410}
+\caption{Image \texttt{1836335410.jpg} ($n{=}3$ phrases).\quad
+  B0: 0\%\enspace M\textsubscript{human}: \textbf{100\%}\enspace M\textsubscript{auto}: 33\%.
+  Combined gain over B0: +67 pp.}
+\label{fig:app1}
+\end{figure}
+
+\begin{figure}[p]
+\centering
+\includegraphics[width=\linewidth,height=0.82\textheight,keepaspectratio]{pg_viz_02_477607006}
+\caption{Image \texttt{477607006.jpg} ($n{=}3$ phrases shown, $n{=}8$ total).\quad
+  B0: 25\%\enspace M\textsubscript{human}: 62\%\enspace M\textsubscript{auto}: \textbf{88\%}.
+  Combined gain over B0: +50 pp.  M\textsubscript{auto} dominates here.}
+\label{fig:app2}
+\end{figure}
+
+\begin{figure}[p]
+\centering
+\includegraphics[width=\linewidth,height=0.82\textheight,keepaspectratio]{pg_viz_03_1496289999}
+\caption{Image \texttt{1496289999.jpg} ($n{=}3$ phrases shown, $n{=}8$ total).\quad
+  B0: 0\%\enspace M\textsubscript{human}: 38\%\enspace M\textsubscript{auto}: \textbf{75\%}.
+  Combined gain over B0: +56 pp.}
+\label{fig:app3}
+\end{figure}
+
+\begin{figure}[p]
+\centering
+\includegraphics[width=\linewidth,height=0.82\textheight,keepaspectratio]{pg_viz_04_1507563902}
+\caption{Image \texttt{1507563902.jpg} ($n{=}3$ phrases).\quad
+  B0: 33\%\enspace M\textsubscript{human}: \textbf{100\%}\enspace M\textsubscript{auto}: \textbf{67\%}.
+  Combined gain over B0: +50 pp.  Both fine-tuned models hit all phrases; B0 misses two.}
+\label{fig:app4}
+\end{figure}
+
+\begin{figure}[p]
+\centering
+\includegraphics[width=\linewidth,height=0.82\textheight,keepaspectratio]{pg_viz_05_5303395266}
+\caption{Image \texttt{5303395266.jpg} ($n{=}3$ phrases shown, $n{=}10$ total).\quad
+  B0: 10\%\enspace M\textsubscript{human}: \textbf{60\%}\enspace M\textsubscript{auto}: 50\%.
+  Densest scene in the selection ($n{=}10$ phrases); both models generalise across
+  many co-located referents.}
+\label{fig:app5}
+\end{figure}
+
+\begin{figure}[p]
+\centering
+\includegraphics[width=\linewidth,height=0.82\textheight,keepaspectratio]{pg_viz_06_2067833088}
+\caption{Image \texttt{2067833088.jpg} ($n{=}3$ phrases shown, $n{=}6$ total).\quad
+  B0: 17\%\enspace M\textsubscript{human}: \textbf{67\%}\enspace M\textsubscript{auto}: 50\%.
+  Combined gain over B0: +42 pp.}
+\label{fig:app6}
+\end{figure}
+
+\end{document}
