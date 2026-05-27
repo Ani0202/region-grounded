@@ -592,12 +592,12 @@ def set_seed(seed):
 def train_one_epoch(model, processor, train_ds, lambda_region,
                     optimizer, scheduler, device, cfg,
                     run_tag='', step_offset=0, eval_every=200,
-                    dataloader_gen=None, keep_best_pg=True):
-    """If keep_best_pg=True, snapshot trainable params whenever the periodic
-    PG eval beats the best-so-far, and restore the best snapshot at the end
-    of training. Fixes the v7 problem where capacity-rich runs (q+k+v LoRA)
-    peak mid-epoch then collapse during late annealing — end-of-epoch eval
-    misses the model's actual best state.
+                    dataloader_gen=None, keep_best_pg=True,
+                    test_rows=None, ckpt_save_dir=None, epochs=1):
+    """Train for `epochs` passes over train_ds. Best-PG snapshot tracking
+    persists across epochs. When test_rows is provided, periodic eval also
+    runs PG on a 200-image test subsample. When ckpt_save_dir is set, saves
+    LoRA adapter at every eval point and separately saves the best-PG model.
     """
     model.train()
     loader = DataLoader(
@@ -614,12 +614,23 @@ def train_one_epoch(model, processor, train_ds, lambda_region,
     best_step  = -1
     best_state = None   # dict of trainable param tensors on CPU
 
+    test_eval_rows = None
+    if test_rows is not None:
+        _trng = random.Random(42)
+        test_eval_rows = _trng.sample(test_rows, min(200, len(test_rows)))
+
     scaler = torch.amp.GradScaler('cuda', enabled=(device == 'cuda'))
 
     total_loss = total_global = total_region = 0.0
     n_steps = 0
+    _steps_per_epoch = len(loader)
 
-    pbar = tqdm(loader, desc=f'train {run_tag}')
+    def _multi_epoch():
+        for _ in range(epochs):
+            yield from loader
+
+    pbar = tqdm(_multi_epoch(), total=_steps_per_epoch * epochs,
+                desc=f'train {run_tag}')
     for pils, captions, orig_sizes, phrase_boxes_batch in pbar:
 
         # ── L_global: image ↔ caption ────────────────────────────────────────
@@ -718,12 +729,13 @@ def train_one_epoch(model, processor, train_ds, lambda_region,
         }, step=global_step)
 
         pbar.set_postfix({
+            'ep':     f'{n_steps // _steps_per_epoch + 1}/{epochs}',
             'loss':   f'{total_loss/n_steps:.3f}',
             'global': f'{total_global/n_steps:.3f}',
             'region': f'{total_region/n_steps:.3f}',
         })
 
-        # ── Periodic Pointing Game eval (primary metric) ──────────────────────
+        # ── Periodic eval (val + test PG) + checkpoint save ───────────────────
         if eval_every > 0 and n_steps % eval_every == 0:
             pg_acc, pg_correct, pg_total = quick_pointing_game_eval(
                 model, processor,
@@ -732,8 +744,17 @@ def train_one_epoch(model, processor, train_ds, lambda_region,
                 device   = device,
             )
             wandb.log({f'{run_tag}/pointing_game': pg_acc}, step=global_step)
-            pbar.write(f'  step {global_step:4d}  Pointing Game = {pg_acc:.2f}%  '
+            pbar.write(f'  step {global_step:4d}  val PG = {pg_acc:.2f}%  '
                        f'({pg_correct}/{pg_total})  [B0=14.74%]')
+
+            if test_eval_rows is not None:
+                t_pg, t_c, t_t = quick_pointing_game_eval(
+                    model, processor, seed=42, device=device,
+                    rows=test_eval_rows,
+                )
+                wandb.log({f'{run_tag}/test_pointing_game': t_pg}, step=global_step)
+                pbar.write(f'           test PG = {t_pg:.2f}%  ({t_c}/{t_t})')
+
             if keep_best_pg and pg_acc > best_pg:
                 best_pg    = pg_acc
                 best_step  = global_step
@@ -741,7 +762,22 @@ def train_one_epoch(model, processor, train_ds, lambda_region,
                               for k, v in model.named_parameters()
                               if v.requires_grad}
                 pbar.write(f'    new best PG = {pg_acc:.2f}% (snapshot kept)')
-            model.train()   # quick_pointing_game_eval calls model.eval(); restore
+                if ckpt_save_dir is not None:
+                    model.save_pretrained(f'{ckpt_save_dir}/best_pg')
+
+            if ckpt_save_dir is not None:
+                model.save_pretrained(f'{ckpt_save_dir}/step_{global_step}')
+                _log_path = f'{ckpt_save_dir}/eval_log.txt'
+                with open(_log_path, 'a') as _f:
+                    _f.write(f'step {global_step:4d}  val PG = {pg_acc:.2f}%  '
+                             f'({pg_correct}/{pg_total})  [B0=14.74%]\\n')
+                    if test_eval_rows is not None:
+                        _f.write(f'step {global_step:4d}  test PG = {t_pg:.2f}%  '
+                                 f'({t_c}/{t_t})\\n')
+                    if keep_best_pg and pg_acc >= best_pg:
+                        _f.write(f'  >> new best PG = {pg_acc:.2f}%\\n')
+
+            model.train()
 
     # Restore best-PG snapshot so subsequent evals see the model's best state.
     if keep_best_pg and best_state is not None:
@@ -805,13 +841,13 @@ TRAIN_MH_SRC = '''# ── 10. Train M_human ───────────�
 # (added capacity in v7/v8/v9 correlated with drift); keeps best-PG snapshot
 # as free insurance.
 
-SEEDS           = [0, 1, 2]          # v10 generalisation test on 90-10 split
+SEEDS           = [1]                # resume: seed 0 done, run seed 1 only
 LAMBDA_OVERRIDE = None               # keep λ=0.5 (proven)
 LORA_TARGETS    = ['q_proj', 'v_proj']   # locked v10: q+v
 REGION_TOP_K    = None               # locked v10: pure max-pool over patches
 PHRASE_REPR     = 'eos'              # locked v10: EOS phrase repr (matches eval)
-EXPERIMENT_TAG  = 'v10_split90'      # locked v10 recipe on 90% of train; 10% held out as test_ds
-CFG['epochs']   = 1                  # locked v10: single cosine, restarts=1.
+EXPERIMENT_TAG  = 'v11_5ep'          # v10 recipe, 5 epochs, periodic test eval + Drive checkpoints
+CFG['epochs']   = 5                  # 5 epochs with cosine restart per epoch
 
 if REGION_TOP_K is not None:
     CFG['region_top_k'] = REGION_TOP_K
@@ -848,6 +884,10 @@ for _var in ['model_mh', 'opt_mh', 'sch_mh']:
 gc.collect()
 torch.cuda.empty_cache()
 print(f'GPU free at start: {torch.cuda.mem_get_info()[0]/1e9:.1f} GB')
+
+import os as _os
+DRIVE_CKPT_DIR = '/content/drive/MyDrive/graft_checkpoints'
+_os.makedirs(DRIVE_CKPT_DIR, exist_ok=True)
 
 v5_results = []
 
@@ -896,7 +936,7 @@ for seed in SEEDS:
     steps_per_epoch = len(train_ds) // CFG['batch_size']
     n_steps_mh     = steps_per_epoch * CFG['epochs']
     opt_mh, sch_mh = make_optimizer_scheduler(
-        model_mh, n_steps_mh, CFG, restarts=1,
+        model_mh, n_steps_mh, CFG, restarts=CFG['epochs'],
     )
 
     # MaskCLIP bypass — train and eval read the same patch representation.
@@ -913,6 +953,9 @@ for seed in SEEDS:
     dl_gen = torch.Generator()
     dl_gen.manual_seed(seed)
 
+    _seed_ckpt_dir = f'{DRIVE_CKPT_DIR}/{EXPERIMENT_TAG}_seed{seed}_lam{CFG["lambda_region"]}'
+    _os.makedirs(_seed_ckpt_dir, exist_ok=True)
+
     stats_ep, ep_steps = train_one_epoch(
         model_mh, processor, train_ds,
         lambda_region = CFG['lambda_region'],
@@ -924,6 +967,9 @@ for seed in SEEDS:
         step_offset   = 0,
         eval_every    = 200,
         dataloader_gen= dl_gen,
+        test_rows     = test_ds.rows,
+        ckpt_save_dir = _seed_ckpt_dir,
+        epochs        = CFG['epochs'],
     )
 
     # Final PG + R@1 on the val split (same protocol as B0, n_images=200).
@@ -1041,7 +1087,7 @@ test_pg_vals = np.array([r.get('test_pg', np.nan) for r in v5_results]) if has_t
 test_rhm_vals= np.array([r.get('test_recall1_halfmax', np.nan) for r in v5_results]) if has_test else None
 
 print('=' * 110)
-print(f'  M_human {EXPERIMENT_TAG}  —  {len(v5_results)} seed(s), 1 epoch, λ={CFG["lambda_region"]}')
+print(f'  M_human {EXPERIMENT_TAG}  —  {len(v5_results)} seed(s), {CFG["epochs"]} epoch(s), λ={CFG["lambda_region"]}')
 print('=' * 110)
 print(f'  {"seed":>5} | {"val PG":>8} | {"test PG":>8} | {"best PG":>8} | {"@step":>6} | '
       f'{"R@1 top-10":>12} | {"R@1 top-25":>12} | {"R@1 halfmax":>13} | {"loss":>7}')
