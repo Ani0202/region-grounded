@@ -15,7 +15,7 @@ import os
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR   = os.path.dirname(SCRIPT_DIR)
 
-IMG_VIZ_01   = os.path.join(BASE_DIR, "report", "pg_viz_01_1836335410.png")
+IMG_VIZ_02   = os.path.join(BASE_DIR, "report", "pg_viz_02_477607006.png")
 IMG_VIZ_04   = os.path.join(BASE_DIR, "report", "pg_viz_04_1507563902.png")
 IMG_FLICKR   = os.path.join(BASE_DIR, "notebooks", "outputs", "flickr30k_entities_grid.png")
 IMG_FLORENCE = os.path.join(BASE_DIR, "notebooks", "florence2_viz.png")
@@ -262,7 +262,49 @@ add_text(sl, Inches(7.1), Inches(6.8), Inches(5.6), Inches(0.35),
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SLIDE 4  GRAFT Architecture
+# SLIDE 4  VLM-to-Encoder Distillation question
+# ─────────────────────────────────────────────────────────────────────────────
+sl = prs.slides.add_slide(BL)
+set_slide_bg(sl, BG_DARK)
+slide_title(sl, "Can a Generalist VLM Replace Human Spatial Annotations?", size=26, accent_w=Inches(9))
+
+add_rect(sl, Inches(0.8), Inches(1.35), Inches(11.7), Inches(0.75),
+         BG_CARD, border_color=ACCENT, corner_radius=0.03)
+add_text(sl, Inches(1.0), Inches(1.4), Inches(11.3), Inches(0.75),
+         "Human annotations are expensive and domain-specific. Can a large generalist VLM generate them instead?",
+         size=18, color=WHITE, align=PP_ALIGN.CENTER)
+
+add_rect(sl, Inches(0.8), Inches(2.35), Inches(5.7), Inches(4.2),
+         BG_CARD, border_color=RED, corner_radius=0.03)
+add_text(sl, Inches(1.1), Inches(2.55), Inches(5.2), Inches(0.4),
+         "The Problem with Human Annotations", size=17, color=RED, bold=True)
+add_bullets(sl, Inches(1.1), Inches(3.05), Inches(5.2), Inches(3.2), [
+    "Expensive to collect at scale",
+    "Fixed vocabulary — tied to dataset phrases",
+    "Hard to extend to new domains",
+    "Flickr30k Entities took years of annotation effort to build",
+], size=14, dot=RED)
+
+add_rect(sl, Inches(6.8), Inches(2.35), Inches(5.7), Inches(4.2),
+         BG_CARD, border_color=ACCENT, corner_radius=0.03)
+add_text(sl, Inches(7.1), Inches(2.55), Inches(5.2), Inches(0.4),
+         "Florence-2 as Annotation Oracle", size=17, color=ACCENT, bold=True)
+add_bullets(sl, Inches(7.1), Inches(3.05), Inches(5.2), Inches(3.2), [
+    ("Generalist VLM ", "— trained on 5B annotations (FLD-5B)"),
+    ("Generates phrase → bbox pairs automatically on any image"),
+    ("No human labellers — scales to CC3M, CC12M and beyond"),
+    ("The question: ", "does annotation quality match human-drawn boxes?"),
+], size=14, dot=ACCENT)
+
+add_rect(sl, Inches(0.8), Inches(6.75), Inches(11.7), Inches(0.55),
+         BG_CARD, border_color=AMBER, corner_radius=0.03)
+add_text(sl, Inches(1.1), Inches(6.8), Inches(11.2), Inches(0.45),
+         "Key design choice: which Florence-2 annotation task to use — explored in detail in Results.",
+         size=15, color=AMBER, bold=True, align=PP_ALIGN.CENTER)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SLIDE 5  GRAFT Architecture
 # ─────────────────────────────────────────────────────────────────────────────
 sl = prs.slides.add_slide(BL)
 set_slide_bg(sl, BG_DARK)
@@ -298,7 +340,7 @@ add_bullets(sl, Inches(7.2), Inches(3.05), Inches(5.2), Inches(3.5), [
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SLIDE 5  Data & Evaluation
+# SLIDE 6  Data & Evaluation
 # ─────────────────────────────────────────────────────────────────────────────
 sl = prs.slides.add_slide(BL)
 set_slide_bg(sl, BG_DARK)
@@ -336,7 +378,7 @@ add_text(sl, Inches(1.1), Inches(5.6), Inches(11.0), Inches(0.6),
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SLIDE 6  Experiment milestones
+# SLIDE 7  Experiment milestones
 # ─────────────────────────────────────────────────────────────────────────────
 sl = prs.slides.add_slide(BL)
 set_slide_bg(sl, BG_DARK)
@@ -558,24 +600,24 @@ set_slide_bg(sl, BG_DARK)
 badge(sl, "QUALITATIVE RESULTS", color=GREEN, w=Inches(3.3))
 
 add_text(sl, Inches(0.8), Inches(1.05), Inches(12.0), Inches(0.55),
-         "Largest Combined Gain — Image 1836335410  (n=3 phrases)",
+         "M_auto Outperforms M_human — Image 477607006  (n=3 phrases shown)",
          size=22, color=WHITE, bold=True)
 
-# image: height=5.65" → width = 5.65 * 0.887 ≈ 5.01"
-sl.shapes.add_picture(IMG_VIZ_01, Inches(0.45), Inches(1.62),
+# image: 1416×1476, ratio 0.96 → height=5.65" → width≈5.42"
+sl.shapes.add_picture(IMG_VIZ_02, Inches(0.45), Inches(1.62),
                       height=Inches(5.65))
 
-SX2 = Inches(6.1)
-add_rect(sl, SX2, Inches(1.62), Inches(6.85), Inches(5.65),
-         BG_CARD, border_color=GREEN, corner_radius=0.03)
+SX2 = Inches(6.3)
+add_rect(sl, SX2, Inches(1.62), Inches(6.65), Inches(5.65),
+         BG_CARD, border_color=AMBER, corner_radius=0.03)
 
-add_text(sl, SX2 + Inches(0.3), Inches(1.85), Inches(6.2), Inches(0.42),
-         "Per-Model Pointing Game  (3 phrases)", size=17, color=ACCENT, bold=True)
-add_line(sl, SX2 + Inches(0.3), Inches(2.33), Inches(6.1), color=BORDER)
+add_text(sl, SX2 + Inches(0.3), Inches(1.85), Inches(6.0), Inches(0.42),
+         "Per-Model Pointing Game  (3 phrases shown)", size=17, color=ACCENT, bold=True)
+add_line(sl, SX2 + Inches(0.3), Inches(2.33), Inches(5.9), color=BORDER)
 
-scores2 = [("Frozen B0:", "0%    ✗✗✗", RED),
-           ("M_human:",   "100%  ✓✓✓", GREEN),
-           ("M_auto:",    "33%   ✓✗✗", AMBER)]
+scores2 = [("Frozen B0:", "25%   ✓✗✗✗", RED),
+           ("M_human:",   "62%   ✓✓✗✗", GREEN),
+           ("M_auto:",    "88%   ✓✓✓✗", AMBER)]
 for j, (lbl, sc, col) in enumerate(scores2):
     y = Inches(2.55 + j * 0.95)
     add_text(sl, SX2 + Inches(0.3), y, Inches(2.3), Inches(0.65),
@@ -583,12 +625,10 @@ for j, (lbl, sc, col) in enumerate(scores2):
     add_text(sl, SX2 + Inches(2.65), y, Inches(3.8), Inches(0.65),
              sc, size=22, color=col, bold=True)
 
-add_line(sl, SX2 + Inches(0.3), Inches(5.55), Inches(6.1), color=BORDER)
-add_text(sl, SX2 + Inches(0.3), Inches(5.7), Inches(6.2), Inches(0.45),
-         "Combined gain over B0: +133 pp across 3 phrases", size=15, color=WHITE, bold=True)
-add_text(sl, SX2 + Inches(0.3), Inches(6.2), Inches(6.2), Inches(0.75),
-         "Frozen model misses every phrase.\n"
-         "Fine-tuned model (M_human) hits every phrase.", size=14, color=LIGHT_GRAY)
+add_line(sl, SX2 + Inches(0.3), Inches(5.55), Inches(5.9), color=BORDER)
+add_text(sl, SX2 + Inches(0.3), Inches(5.7), Inches(6.0), Inches(0.75),
+         "Auto-annotations can match or exceed human labels\n"
+         "when vocabulary is correctly aligned.", size=14, color=LIGHT_GRAY)
 
 add_text(sl, Inches(0.45), Inches(7.3), Inches(5.5), Inches(0.25),
          "Columns: Frozen B0  |  M_human  |  M_auto", size=12, color=MED_GRAY)
